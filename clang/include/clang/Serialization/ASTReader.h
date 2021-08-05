@@ -940,10 +940,6 @@ private:
   /// Whether to accept an AST file with compiler errors.
   bool AllowASTWithCompilerErrors;
 
-  /// Whether to accept an AST file that has a different configuration
-  /// from the current compiler instance.
-  bool AllowConfigurationMismatch;
-
   /// Whether validate system input files.
   bool ValidateSystemInputs;
 

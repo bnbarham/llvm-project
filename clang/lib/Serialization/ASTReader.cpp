@@ -2474,21 +2474,6 @@ void ASTReader::ResolveImportedPath(std::string &Filename, StringRef Prefix) {
   Filename.assign(Buffer.begin(), Buffer.end());
 }
 
-static bool isDiagnosedResult(ASTReader::ASTReadResult ARR, unsigned Caps) {
-  switch (ARR) {
-  case ASTReader::Failure: return true;
-  case ASTReader::Missing: return !(Caps & ASTReader::ARR_Missing);
-  case ASTReader::OutOfDate: return !(Caps & ASTReader::ARR_OutOfDate);
-  case ASTReader::VersionMismatch: return !(Caps & ASTReader::ARR_VersionMismatch);
-  case ASTReader::ConfigurationMismatch:
-    return !(Caps & ASTReader::ARR_ConfigurationMismatch);
-  case ASTReader::HadErrors: return true;
-  case ASTReader::Success: return false;
-  }
-
-  llvm_unreachable("unknown ASTReadResult");
-}
-
 ASTReader::ASTReadResult ASTReader::ReadOptionsBlock(
     BitstreamCursor &Stream, unsigned ClientLoadCapabilities,
     bool AllowCompatibleConfigurationMismatch, ASTReaderListener &Listener,
@@ -2502,6 +2487,7 @@ ASTReader::ASTReadResult ASTReader::ReadOptionsBlock(
   // Read all of the records in the options block.
   RecordData Record;
   ASTReadResult Result = Success;
+  bool CanHandleMismatch = ClientLoadCapabilities & ARR_ConfigurationMismatch;
   while (true) {
     Expected<llvm::BitstreamEntry> MaybeEntry = Stream.advance();
     if (!MaybeEntry) {
@@ -2517,6 +2503,8 @@ ASTReader::ASTReadResult ASTReader::ReadOptionsBlock(
       return Failure;
 
     case llvm::BitstreamEntry::EndBlock:
+      if (Result == ConfigurationMismatch && !CanHandleMismatch)
+        Result = Failure;
       return Result;
 
     case llvm::BitstreamEntry::Record:
@@ -2534,41 +2522,36 @@ ASTReader::ASTReadResult ASTReader::ReadOptionsBlock(
     }
     switch ((OptionsRecordTypes)MaybeRecordType.get()) {
     case LANGUAGE_OPTIONS: {
-      bool Complain = (ClientLoadCapabilities & ARR_ConfigurationMismatch) == 0;
-      if (ParseLanguageOptions(Record, Complain, Listener,
+      if (ParseLanguageOptions(Record, !CanHandleMismatch, Listener,
                                AllowCompatibleConfigurationMismatch))
         Result = ConfigurationMismatch;
       break;
     }
 
     case TARGET_OPTIONS: {
-      bool Complain = (ClientLoadCapabilities & ARR_ConfigurationMismatch) == 0;
-      if (ParseTargetOptions(Record, Complain, Listener,
+      if (ParseTargetOptions(Record, !CanHandleMismatch, Listener,
                              AllowCompatibleConfigurationMismatch))
         Result = ConfigurationMismatch;
       break;
     }
 
     case FILE_SYSTEM_OPTIONS: {
-      bool Complain = (ClientLoadCapabilities & ARR_ConfigurationMismatch) == 0;
       if (!AllowCompatibleConfigurationMismatch &&
-          ParseFileSystemOptions(Record, Complain, Listener))
+          ParseFileSystemOptions(Record, !CanHandleMismatch, Listener))
         Result = ConfigurationMismatch;
       break;
     }
 
     case HEADER_SEARCH_OPTIONS: {
-      bool Complain = (ClientLoadCapabilities & ARR_ConfigurationMismatch) == 0;
       if (!AllowCompatibleConfigurationMismatch &&
-          ParseHeaderSearchOptions(Record, Complain, Listener))
+          ParseHeaderSearchOptions(Record, !CanHandleMismatch, Listener))
         Result = ConfigurationMismatch;
       break;
     }
 
     case PREPROCESSOR_OPTIONS:
-      bool Complain = (ClientLoadCapabilities & ARR_ConfigurationMismatch) == 0;
       if (!AllowCompatibleConfigurationMismatch &&
-          ParsePreprocessorOptions(Record, Complain, Listener,
+          ParsePreprocessorOptions(Record, !CanHandleMismatch, Listener,
                                    SuggestedPredefines))
         Result = ConfigurationMismatch;
       break;
@@ -2655,7 +2638,7 @@ ASTReader::ReadControlBlock(ModuleFile &F,
         for (unsigned I = 0; I < N; ++I) {
           InputFile IF = getInputFile(F, I+1, Complain);
           if (!IF.getFile() || IF.isOutOfDate())
-            return OutOfDate;
+            return Complain ? Failure : OutOfDate;
         }
       }
 
@@ -2711,11 +2694,9 @@ ASTReader::ReadControlBlock(ModuleFile &F,
           if (Result == Failure) {
             Error("malformed block record in AST file");
             return Result;
-          }
-
-          if (DisableValidation ||
-              (AllowConfigurationMismatch && Result == ConfigurationMismatch))
+          } else if (DisableValidation) {
             Result = Success;
+          }
 
           // If we can't load the module, exit early since we likely
           // will rebuild the module anyway. The stream may be in the
@@ -2753,9 +2734,11 @@ ASTReader::ReadControlBlock(ModuleFile &F,
     switch ((ControlRecordTypes)MaybeRecordType.get()) {
     case METADATA: {
       if (Record[0] != VERSION_MAJOR && !DisableValidation) {
-        if ((ClientLoadCapabilities & ARR_VersionMismatch) == 0)
+        if ((ClientLoadCapabilities & ARR_VersionMismatch) == 0) {
           Diag(Record[0] < VERSION_MAJOR? diag::err_pch_version_too_old
                                         : diag::err_pch_version_too_new);
+          return Failure;
+        }
         return VersionMismatch;
       }
 
@@ -2788,8 +2771,10 @@ ASTReader::ReadControlBlock(ModuleFile &F,
       const std::string &CurBranch = getClangFullRepositoryVersion();
       StringRef ASTBranch = Blob;
       if (StringRef(CurBranch) != ASTBranch && !DisableValidation) {
-        if ((ClientLoadCapabilities & ARR_VersionMismatch) == 0)
+        if ((ClientLoadCapabilities & ARR_VersionMismatch) == 0) {
           Diag(diag::err_pch_different_branch) << ASTBranch << CurBranch;
+          return Failure;
+        }
         return VersionMismatch;
       }
       break;
@@ -2848,20 +2833,13 @@ ASTReader::ReadControlBlock(ModuleFile &F,
         auto Result = ReadASTCore(ImportedFile, ImportedKind, ImportLoc, &F,
                                   Loaded, StoredSize, StoredModTime,
                                   StoredSignature, Capabilities);
-
-        // If we diagnosed a problem, produce a backtrace.
-        bool recompilingFinalized =
-            Result == OutOfDate && (Capabilities & ARR_OutOfDate) &&
-            getModuleManager().getModuleCache().isPCMFinal(F.FileName);
-        if (isDiagnosedResult(Result, Capabilities) || recompilingFinalized)
+        switch (Result) {
+        case Failure:
+          // Attach a note with the module that imported the current module
           Diag(diag::note_module_file_imported_by)
               << F.FileName << !F.ModuleName.empty() << F.ModuleName;
-        if (recompilingFinalized)
-          Diag(diag::note_module_file_conflict);
-
-        switch (Result) {
-        case Failure: return Failure;
-          // If we have to ignore the dependency, we'll have to ignore this too.
+          return Failure;
+        // If we have to ignore the dependency, we'll have to ignore this too.
         case Missing:
         case OutOfDate: return OutOfDate;
         case VersionMismatch: return VersionMismatch;
@@ -2923,9 +2901,11 @@ ASTReader::ReadControlBlock(ModuleFile &F,
             F.Kind != MK_ExplicitModule && F.Kind != MK_PrebuiltModule) {
           auto BuildDir = PP.getFileManager().getDirectory(Blob);
           if (!BuildDir || *BuildDir != M->Directory) {
-            if (!canRecoverFromOutOfDate(F.FileName, ClientLoadCapabilities))
+            if (!canRecoverFromOutOfDate(F.FileName, ClientLoadCapabilities)) {
               Diag(diag::err_imported_module_relocated)
                   << F.ModuleName << Blob << M->Directory->getName();
+              return Failure;
+            }
             return OutOfDate;
           }
         }
@@ -3960,6 +3940,7 @@ ASTReader::ReadModuleMapFileBlock(RecordData &Record, ModuleFile &F,
             Diag(diag::note_imported_by_pch_module_not_found)
                 << llvm::sys::path::parent_path(F.ModuleMapPath);
         }
+        return Failure;
       }
       return OutOfDate;
     }
@@ -3973,10 +3954,12 @@ ASTReader::ReadModuleMapFileBlock(RecordData &Record, ModuleFile &F,
       assert((ImportedBy || F.Kind == MK_ImplicitModule) &&
              "top-level import should be verified");
       bool NotImported = F.Kind == MK_ImplicitModule && !ImportedBy;
-      if (!canRecoverFromOutOfDate(F.FileName, ClientLoadCapabilities))
+      if (!canRecoverFromOutOfDate(F.FileName, ClientLoadCapabilities)) {
         Diag(diag::err_imported_module_modmap_changed)
             << F.ModuleName << (NotImported ? F.FileName : ImportedBy->FileName)
             << ModMap->getName() << F.ModuleMapPath << NotImported;
+        return Failure;
+      }
       return OutOfDate;
     }
 
@@ -3986,8 +3969,10 @@ ASTReader::ReadModuleMapFileBlock(RecordData &Record, ModuleFile &F,
       std::string Filename = ReadPath(F, Record, Idx);
       auto SF = FileMgr.getFile(Filename, false, false);
       if (!SF) {
-        if (!canRecoverFromOutOfDate(F.FileName, ClientLoadCapabilities))
+        if (!canRecoverFromOutOfDate(F.FileName, ClientLoadCapabilities)) {
           Error("could not find file '" + Filename +"' referenced by AST file");
+          return Failure;
+        }
         return OutOfDate;
       }
       AdditionalStoredMaps.insert(*SF);
@@ -4000,9 +3985,11 @@ ASTReader::ReadModuleMapFileBlock(RecordData &Record, ModuleFile &F,
         // Remove files that match
         // Note: SmallPtrSet::erase is really remove
         if (!AdditionalStoredMaps.erase(ModMap)) {
-          if (!canRecoverFromOutOfDate(F.FileName, ClientLoadCapabilities))
+          if (!canRecoverFromOutOfDate(F.FileName, ClientLoadCapabilities)) {
             Diag(diag::err_module_different_modmap)
               << F.ModuleName << /*new*/0 << ModMap->getName();
+            return Failure;
+          }
           return OutOfDate;
         }
       }
@@ -4011,9 +3998,11 @@ ASTReader::ReadModuleMapFileBlock(RecordData &Record, ModuleFile &F,
     // Check any additional module map files that are in the pcm, but not
     // found in header search. Cases that match are already removed.
     for (const FileEntry *ModMap : AdditionalStoredMaps) {
-      if (!canRecoverFromOutOfDate(F.FileName, ClientLoadCapabilities))
+      if (!canRecoverFromOutOfDate(F.FileName, ClientLoadCapabilities)) {
         Diag(diag::err_module_different_modmap)
           << F.ModuleName << /*not new*/1 << ModMap->getName();
+        return Failure;
+      }
       return OutOfDate;
     }
   }
@@ -4255,19 +4244,11 @@ ASTReader::ASTReadResult ASTReader::ReadAST(StringRef FileName,
   };
 
   SmallVector<ImportedModule, 4> Loaded;
-  switch (ASTReadResult ReadResult =
-              ReadASTCore(FileName, Type, ImportLoc,
-                          /*ImportedBy=*/nullptr, Loaded, 0, 0,
-                          ASTFileSignature(), ClientLoadCapabilities)) {
-  case Failure:
-  case Missing:
-  case OutOfDate:
-  case VersionMismatch:
-  case ConfigurationMismatch:
-  case HadErrors:
+  if (ASTReadResult ReadResult = ReadASTCore(FileName, Type, ImportLoc,
+                                             /*ImportedBy=*/nullptr, Loaded, 0,
+                                             0, ASTFileSignature(),
+                                             ClientLoadCapabilities)) {
     return removeModulesAndReturn(ReadResult);
-  case Success:
-    break;
   }
 
   // Here comes stuff that we only do once the entire chain is loaded.
@@ -4600,36 +4581,31 @@ ASTReader::ReadASTCore(StringRef FileName,
     switch (Entry.ID) {
     case CONTROL_BLOCK_ID:
       HaveReadControlBlock = true;
-      switch (ReadControlBlock(F, Loaded, ImportedBy, ClientLoadCapabilities)) {
-      case Success:
-        // Check that we didn't try to load a non-module AST file as a module.
-        //
-        // FIXME: Should we also perform the converse check? Loading a module as
-        // a PCH file sort of works, but it's a bit wonky.
-        if ((Type == MK_ImplicitModule || Type == MK_ExplicitModule ||
-             Type == MK_PrebuiltModule) &&
-            F.ModuleName.empty()) {
-          auto Result = (Type == MK_ImplicitModule) ? OutOfDate : Failure;
-          if (Result != OutOfDate ||
-              (ClientLoadCapabilities & ARR_OutOfDate) == 0)
-            Diag(diag::err_module_file_not_module) << FileName;
-          return Result;
-        }
-        break;
+      if (ASTReadResult Result =
+          ReadControlBlock(F, Loaded, ImportedBy, ClientLoadCapabilities))
+        return Result;
 
-      case Failure: return Failure;
-      case Missing: return Missing;
-      case OutOfDate: return OutOfDate;
-      case VersionMismatch: return VersionMismatch;
-      case ConfigurationMismatch: return ConfigurationMismatch;
-      case HadErrors: return HadErrors;
+      // Check that we didn't try to load a non-module AST file as a module.
+      //
+      // FIXME: Should we also perform the converse check? Loading a module as
+      // a PCH file sort of works, but it's a bit wonky.
+      if ((Type == MK_ImplicitModule || Type == MK_ExplicitModule ||
+           Type == MK_PrebuiltModule) && F.ModuleName.empty()) {
+        if (Type != MK_ImplicitModule ||
+            (ClientLoadCapabilities & ARR_OutOfDate) == 0) {
+          Diag(diag::err_module_file_not_module) << FileName;
+          return Failure;
+        }
+        return OutOfDate;
       }
       break;
 
     case AST_BLOCK_ID:
       if (!HaveReadControlBlock) {
-        if ((ClientLoadCapabilities & ARR_VersionMismatch) == 0)
+        if ((ClientLoadCapabilities & ARR_VersionMismatch) == 0) {
           Diag(diag::err_pch_version_too_old);
+          return Failure;
+        }
         return VersionMismatch;
       }
 
@@ -4672,8 +4648,7 @@ ASTReader::readUnhashedControlBlock(ModuleFile &F, bool WasImportedBy,
 
   // If F was directly imported by another module, it's implicitly validated by
   // the importing module.
-  if (DisableValidation || WasImportedBy ||
-      (AllowConfigurationMismatch && Result == ConfigurationMismatch))
+  if (DisableValidation || WasImportedBy)
     return Success;
 
   if (Result == Failure) {
@@ -4773,8 +4748,10 @@ ASTReader::ASTReadResult ASTReader::readUnhashedControlBlockImpl(
       bool Complain = (ClientLoadCapabilities & ARR_OutOfDate) == 0;
       if (Listener && ValidateDiagnosticOptions &&
           !AllowCompatibleConfigurationMismatch &&
-          ParseDiagnosticOptions(Record, Complain, *Listener))
-        Result = OutOfDate; // Don't return early.  Read the signature.
+          ParseDiagnosticOptions(Record, Complain, *Listener)) {
+        // Don't return early. Still need to read the signature.
+        Result = Complain ? Failure : OutOfDate;
+      }
       break;
     }
     case DIAG_PRAGMA_MAPPINGS:
@@ -11647,8 +11624,7 @@ ASTReader::ASTReader(Preprocessor &PP, InMemoryModuleCache &ModuleCache,
                      ArrayRef<std::shared_ptr<ModuleFileExtension>> Extensions,
                      StringRef isysroot,
                      DisableValidationForModuleKind DisableValidationKind,
-                     bool AllowASTWithCompilerErrors,
-                     bool AllowConfigurationMismatch, bool ValidateSystemInputs,
+                     bool AllowASTWithCompilerErrors, bool ValidateSystemInputs,
                      bool ValidateASTInputFilesContent, bool UseGlobalIndex,
                      std::unique_ptr<llvm::Timer> ReadTimer)
     : Listener(bool(DisableValidationKind &DisableValidationForModuleKind::PCH)
@@ -11661,7 +11637,6 @@ ASTReader::ASTReader(Preprocessor &PP, InMemoryModuleCache &ModuleCache,
       DummyIdResolver(PP), ReadTimer(std::move(ReadTimer)), isysroot(isysroot),
       DisableValidationKind(DisableValidationKind),
       AllowASTWithCompilerErrors(AllowASTWithCompilerErrors),
-      AllowConfigurationMismatch(AllowConfigurationMismatch),
       ValidateSystemInputs(ValidateSystemInputs),
       ValidateASTInputFilesContent(ValidateASTInputFilesContent),
       UseGlobalIndex(UseGlobalIndex), CurrSwitchCaseStmts(&SwitchCaseStmts) {
