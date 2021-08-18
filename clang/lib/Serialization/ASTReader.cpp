@@ -2695,6 +2695,10 @@ ASTReader::ReadControlBlock(ModuleFile &F,
             Error("malformed block record in AST file");
             return Result;
           } else if (DisableValidation) {
+            // Probably need to leave AllowConfigurationMismatch in. Seems like
+            // it would make Result = Success in this case. Can we rely on the
+            // client passing in ConfigurationMismatch as a load capability? Or
+            // should we just set it if Allow/DisableValidation is set?
             Result = Success;
           }
 
