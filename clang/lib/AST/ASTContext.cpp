@@ -283,9 +283,8 @@ RawComment *ASTContext::getRawCommentForDeclNoCache(const Decl *D) const {
   if (DeclLoc.isInvalid() || !DeclLoc.isFileID())
     return nullptr;
 
-  if (ExternalSource && !CommentsLoaded) {
+  if (ExternalSource) {
     ExternalSource->ReadComments();
-    CommentsLoaded = true;
   }
 
   if (Comments.empty())

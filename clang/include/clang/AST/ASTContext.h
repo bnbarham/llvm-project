@@ -700,9 +700,6 @@ public:
   /// All comments in this translation unit.
   RawCommentList Comments;
 
-  /// True if comments are already loaded from ExternalASTSource.
-  mutable bool CommentsLoaded = false;
-
   /// Mapping from declaration to directly attached comment.
   ///
   /// Raw comments are owned by Comments list.  This mapping is populated

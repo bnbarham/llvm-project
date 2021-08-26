@@ -2273,6 +2273,7 @@ public:
   /// Cursors for comments blocks.
   SmallVector<std::pair<llvm::BitstreamCursor,
                         serialization::ModuleFile *>, 8> CommentsCursors;
+  size_t NumCommentsRead = 0;
 
   /// Loads comments ranges.
   void ReadComments() override;

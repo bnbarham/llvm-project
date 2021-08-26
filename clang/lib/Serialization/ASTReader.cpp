@@ -9075,16 +9075,21 @@ void ASTReader::ClearSwitchCaseIDs() {
 }
 
 void ASTReader::ReadComments() {
+  // Already up to date
+  if (CommentsCursors.size() <= NumCommentsRead)
+    return;
+
+  auto NewCursors = llvm::makeMutableArrayRef(CommentsCursors.data(),
+                                              CommentsCursors.size());
+  NewCursors = NewCursors.drop_front(NumCommentsRead);
+  NumCommentsRead = CommentsCursors.size();
+
   ASTContext &Context = getContext();
-  std::vector<RawComment *> Comments;
-  for (SmallVectorImpl<std::pair<BitstreamCursor,
-                                 serialization::ModuleFile *>>::iterator
-       I = CommentsCursors.begin(),
-       E = CommentsCursors.end();
-       I != E; ++I) {
+  SmallVector<RawComment *, 0> Comments;
+  for (auto &Pair : NewCursors) {
     Comments.clear();
-    BitstreamCursor &Cursor = I->first;
-    serialization::ModuleFile &F = *I->second;
+    BitstreamCursor &Cursor = Pair.first;
+    serialization::ModuleFile &F = *Pair.second;
     SavedStreamPosition SavedPosition(Cursor);
 
     RecordData Record;
