@@ -92,6 +92,8 @@ class LineTableInfo {
   std::map<FileID, std::vector<LineEntry>> LineEntries;
 
 public:
+  using Range = std::pair<const LineEntry *, const LineEntry *>;
+
   void clear() {
     FilenameIDs.clear();
     FilenamesByID.clear();
@@ -112,10 +114,13 @@ public:
                    unsigned EntryExit, SrcMgr::CharacteristicKind FileKind);
 
 
-  /// Find the line entry nearest to FID that is before it.
-  ///
-  /// If there is no line entry before \p Offset in \p FID, returns null.
+  /// Find the line entry in \p FID before \p Offset, or nullptr if there is
+  /// none.
   const LineEntry *FindNearestLineEntry(FileID FID, unsigned Offset);
+
+  /// The entries for the given \p FID or an empty \c ArrayRef if there isn't
+  /// any.
+  ArrayRef<LineEntry> entries(FileID FID);
 
   // Low-level access
   using iterator = std::map<FileID, std::vector<LineEntry>>::iterator;

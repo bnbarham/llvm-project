@@ -1548,8 +1548,13 @@ public:
   /// Determine if the source manager has a line table.
   bool hasLineTable() const { return LineTable != nullptr; }
 
-  /// Retrieve the stored line table.
+  /// Retrieve the stored line table, adding a new empty line table if none
+  /// exists.
   LineTableInfo &getLineTable();
+
+  /// Retrieve the stored line table, nullptr if there currently isn't any.
+  // TODO: Why is the line table lazy/split into internals?
+  LineTableInfo *getCurrentLineTable() const;
 
   //===--------------------------------------------------------------------===//
   // Queries for performance analysis.

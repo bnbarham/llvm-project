@@ -234,11 +234,9 @@ void LineTableInfo::AddLineNote(FileID FID, unsigned Offset, unsigned LineNo,
                                    IncludeOffset));
 }
 
-/// FindNearestLineEntry - Find the line entry nearest to FID that is before
-/// it.  If there is no line entry before Offset in FID, return null.
 const LineEntry *LineTableInfo::FindNearestLineEntry(FileID FID,
                                                      unsigned Offset) {
-  const std::vector<LineEntry> &Entries = LineEntries[FID];
+  ArrayRef<LineEntry> Entries = entries(FID);
   assert(!Entries.empty() && "No #line entries for this FID after all!");
 
   // It is very common for the query to be after the last #line, check this
@@ -247,10 +245,17 @@ const LineEntry *LineTableInfo::FindNearestLineEntry(FileID FID,
     return &Entries.back();
 
   // Do a binary search to find the maximal element that is still before Offset.
-  std::vector<LineEntry>::const_iterator I = llvm::upper_bound(Entries, Offset);
+  auto I = llvm::upper_bound(Entries, Offset);
   if (I == Entries.begin())
     return nullptr;
   return &*--I;
+}
+
+ArrayRef<LineEntry> LineTableInfo::entries(FileID FID) {
+  auto It = LineEntries.find(FID);
+  if (It != LineEntries.end())
+    return llvm::makeArrayRef(It->second);
+  return ArrayRef<LineEntry>();
 }
 
 /// Add a new line entry that has already been encoded into
@@ -300,6 +305,10 @@ LineTableInfo &SourceManager::getLineTable() {
   if (!LineTable)
     LineTable.reset(new LineTableInfo());
   return *LineTable;
+}
+
+LineTableInfo *SourceManager::getCurrentLineTable() const {
+  return LineTable.get();
 }
 
 //===----------------------------------------------------------------------===//
