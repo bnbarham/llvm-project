@@ -40,6 +40,7 @@ struct DummyFile : public vfs::File {
     llvm_unreachable("unimplemented");
   }
   std::error_code close() override { return std::error_code(); }
+  void setPath(const Twine &Path) override { S = S.copyWithNewName(S, Path); }
 };
 
 class DummyFileSystem : public vfs::FileSystem {
@@ -151,10 +152,14 @@ public:
     return FilesAndDirs.find(std::string(P.str()));
   }
 
-  void addRegularFile(StringRef Path, sys::fs::perms Perms = sys::fs::all_all) {
-    vfs::Status S(Path, UniqueID(FSID, FileID++),
+  void addRegularFile(StringRef Path, sys::fs::perms Perms = sys::fs::all_all,
+                      StringRef ExternalPath = StringRef()) {
+    StringRef StatusPath = ExternalPath.empty() ? Path : ExternalPath;
+    vfs::Status S(StatusPath, UniqueID(FSID, FileID++),
                   std::chrono::system_clock::now(), 0, 0, 1024,
                   sys::fs::file_type::regular_file, Perms);
+    if (!ExternalPath.empty())
+      S.ExposesExternalVFSPath = true;
     addEntry(Path, S);
   }
 
@@ -204,6 +209,39 @@ std::string getPosixPath(std::string S) {
   llvm::sys::path::native(S, Result, llvm::sys::path::Style::posix);
   return std::string(Result.str());
 }
+
+#define EXPECT_PATHS(FS, Path, Expected, ExpectedRealPath)                     \
+  checkAllFSPaths(FS, Path, Expected, ExpectedRealPath, __LINE__)
+
+/// Check that the path returned by \c openFileForRead(Path)->getName() and
+/// \c status(Path)->getName() match \p Expected and \c getRealPath(Path)
+/// matches \p ExpectedRealPath.
+static void checkAllFSPaths(vfs::FileSystem &FS, StringRef Path,
+                            StringRef Expected, StringRef ExpectedRealPath,
+                            int Line) {
+  testing::ScopedTrace trace(__FILE__, Line, "EXPECT_PATHS");
+
+  auto F = FS.openFileForRead(Path);
+  ASSERT_FALSE(F.getError());
+
+  auto Name = (*F)->getName();
+  ASSERT_FALSE(Name.getError());
+  EXPECT_EQ(Expected, *Name);
+  auto Status = (*F)->status();
+  ASSERT_FALSE(Status.getError());
+  EXPECT_TRUE(Status->exists());
+  EXPECT_EQ(Expected, Status->getName());
+
+  Status = FS.status(Path);
+  ASSERT_FALSE(Status.getError());
+  EXPECT_EQ(Expected, Status->getName());
+
+  SmallString<256> RealPath;
+  auto EC = FS.getRealPath(Path, RealPath);
+  ASSERT_FALSE(EC);
+  EXPECT_EQ(ExpectedRealPath, RealPath);
+}
+
 } // end anonymous namespace
 
 TEST(VirtualFileSystemTest, StatusQueries) {
@@ -897,6 +935,119 @@ TEST(OverlayFileSystemTest, PrintOutput) {
             Output);
 }
 
+// Base has no CWD, Overlay shouldn't either
+TEST(OverlayFileSystemTest, BaseNoWorkingDir) {
+  auto EmptyFS = makeIntrusiveRefCnt<DummyFileSystem>();
+  auto OverlayFS = makeIntrusiveRefCnt<vfs::OverlayFileSystem>(EmptyFS);
+  ASSERT_TRUE(OverlayFS->getCurrentWorkingDirectory().getError());
+}
+
+// Base has CWD, overlay should too
+TEST(OverlayFileSystemTest, BaseWithWorkingDir) {
+  auto DummyFS1 = makeIntrusiveRefCnt<DummyFileSystem>();
+  DummyFS1->setCurrentWorkingDirectory("/root");
+  auto OverlayFS = makeIntrusiveRefCnt<vfs::OverlayFileSystem>(DummyFS1);
+  auto CWD = OverlayFS->getCurrentWorkingDirectory();
+  ASSERT_FALSE(CWD.getError());
+  EXPECT_EQ("/root", *CWD);
+}
+
+TEST(OverlayFileSystemTest, WorkingDir) {
+  auto EmptyFS = makeIntrusiveRefCnt<DummyFileSystem>();
+  auto DummyFS = makeIntrusiveRefCnt<DummyFileSystem>();
+  DummyFS->addDirectory("/root");
+  DummyFS->addDirectory("/root2");
+  DummyFS->addDirectory("/root2/b");
+  DummyFS->setCurrentWorkingDirectory("/root");
+  auto OverlayFS = makeIntrusiveRefCnt<vfs::OverlayFileSystem>(EmptyFS);
+
+  // OverlayFS should still have no CWD since it hasn't been set yet. The CWD
+  // of DummyFS should not be affected by the push.
+  OverlayFS->pushOverlay(DummyFS);
+  auto CWD = OverlayFS->getCurrentWorkingDirectory();
+  EXPECT_TRUE(CWD.getError());
+  CWD = DummyFS->getCurrentWorkingDirectory();
+  ASSERT_FALSE(CWD.getError());
+  EXPECT_EQ("/root", *CWD);
+
+  // Should be able to setCWD on OverlayFS
+  auto EC = OverlayFS->setCurrentWorkingDirectory("/root2");
+  EXPECT_FALSE(EC);
+  CWD = OverlayFS->getCurrentWorkingDirectory();
+  ASSERT_FALSE(CWD.getError());
+  EXPECT_EQ("/root2", *CWD);
+
+  EC = OverlayFS->setCurrentWorkingDirectory("b");
+  EXPECT_FALSE(EC);
+  CWD = OverlayFS->getCurrentWorkingDirectory();
+  ASSERT_FALSE(CWD.getError());
+  EXPECT_EQ("/root2/b", *CWD);
+
+  // Can't set if the underlying path doesn't exist in any FS
+  EC = OverlayFS->setCurrentWorkingDirectory("/notfound");
+  EXPECT_TRUE(EC);
+  CWD = OverlayFS->getCurrentWorkingDirectory();
+  ASSERT_FALSE(CWD.getError());
+  EXPECT_EQ("/root2/b", *CWD);
+
+  // Shouldn't touch the underlying CWD
+  CWD = DummyFS->getCurrentWorkingDirectory();
+  ASSERT_FALSE(CWD.getError());
+  EXPECT_EQ("/root", *CWD);
+}
+
+// Check CWD works across contained FS
+TEST(OverlayFileSystemTest, BasicRelativePath) {
+  auto FS1 = makeIntrusiveRefCnt<DummyFileSystem>();
+  FS1->addDirectory("/dir");
+  auto FS2 = makeIntrusiveRefCnt<DummyFileSystem>();
+  FS2->addRegularFile("/dir/../f");
+  FS2->addRegularFile("/dir/../f2", sys::fs::all_all, "/another/path/f2");
+  auto OverlayFS = makeIntrusiveRefCnt<vfs::OverlayFileSystem>(FS2);
+  OverlayFS->pushOverlay(FS1);
+
+  auto EC = OverlayFS->setCurrentWorkingDirectory("/dir");
+  EXPECT_FALSE(EC);
+  auto CWD = OverlayFS->getCurrentWorkingDirectory();
+  ASSERT_FALSE(CWD.getError());
+  EXPECT_EQ("/dir", *CWD);
+
+  EXPECT_PATHS(*OverlayFS, "../f", "../f", "/dir/../f");
+  EXPECT_PATHS(*OverlayFS, "../f2", "/another/path/f2", "/dir/../f2");
+}
+
+// Check that we don't inadvertently get the wrong file when a higher FS doesn't
+// contain the set CWD
+TEST(OverlayFileSystemTest, DifferentRootRelativePath) {
+  auto FS1 = makeIntrusiveRefCnt<vfs::InMemoryFileSystem>();
+  FS1->addFile("/a/b", 0, MemoryBuffer::getMemBuffer("/a/b"));
+  FS1->setCurrentWorkingDirectory("/");
+  auto FS2 = makeIntrusiveRefCnt<vfs::InMemoryFileSystem>();
+  FS2->addFile("/c/a/b", 0, MemoryBuffer::getMemBuffer("/c/a/b"));
+  auto OverlayFS = makeIntrusiveRefCnt<vfs::OverlayFileSystem>(FS2);
+  OverlayFS->pushOverlay(FS1);
+
+  auto EC = OverlayFS->setCurrentWorkingDirectory("/c");
+  EXPECT_FALSE(EC);
+  auto CWD = OverlayFS->getCurrentWorkingDirectory();
+  ASSERT_FALSE(CWD.getError());
+  EXPECT_EQ("/c", *CWD);
+
+  // FS1 is on top of FS2, but since our CWD is /c we should be looking for
+  // /c/a/b *not* /a/b and thus the file should be found from FS2
+  auto F = OverlayFS->openFileForRead("a/b");
+  ASSERT_FALSE(F.getError());
+  auto Buffer = (*F)->getBuffer("ignored");
+  ASSERT_FALSE(Buffer.getError());
+  EXPECT_EQ("/c/a/b", (*Buffer)->getBuffer());
+  auto Name = (*F)->getName();
+  ASSERT_FALSE(Name.getError());
+  EXPECT_EQ("a/b", *Name);
+  auto Status = (*F)->status();
+  ASSERT_FALSE(Status.getError());
+  EXPECT_EQ("a/b", Status->getName());
+}
+
 TEST(ProxyFileSystemTest, Basic) {
   IntrusiveRefCntPtr<vfs::InMemoryFileSystem> Base(
       new vfs::InMemoryFileSystem());
@@ -1056,6 +1207,9 @@ TEST_F(InMemoryFileSystemTest, DirectoryIteration) {
 }
 
 TEST_F(InMemoryFileSystemTest, WorkingDirectory) {
+  auto EC = FS.setCurrentWorkingDirectory("");
+  ASSERT_EQ(EC, std::errc::no_such_file_or_directory);
+
   FS.setCurrentWorkingDirectory("/b");
   FS.addFile("c", 0, MemoryBuffer::getMemBuffer(""));
 

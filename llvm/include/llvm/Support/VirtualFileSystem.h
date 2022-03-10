@@ -370,6 +370,10 @@ class OverlayFileSystem : public FileSystem {
   /// their addition.
   FileSystemList FSList;
 
+  /// The last CWD successfully set on at least one of the filesystems in
+  /// \c FSList.
+  std::string CWD;
+
 public:
   OverlayFileSystem(IntrusiveRefCntPtr<FileSystem> Base);
 
@@ -380,8 +384,14 @@ public:
   llvm::ErrorOr<std::unique_ptr<File>>
   openFileForRead(const Twine &Path) override;
   directory_iterator dir_begin(const Twine &Dir, std::error_code &EC) override;
+
+  /// Gets the last successfully set CWD, which starts as the CWD from \c Base.
   llvm::ErrorOr<std::string> getCurrentWorkingDirectory() const override;
+
+  /// Attempts to set the CWD on all contained FS. Only errors if they all
+  /// fail.
   std::error_code setCurrentWorkingDirectory(const Twine &Path) override;
+
   std::error_code isLocal(const Twine &Path, bool &Result) override;
   std::error_code getRealPath(const Twine &Path,
                               SmallVectorImpl<char> &Output) const override;

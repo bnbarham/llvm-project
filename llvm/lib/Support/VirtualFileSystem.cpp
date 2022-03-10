@@ -73,15 +73,19 @@ Status::Status(const Twine &Name, UniqueID UID, sys::TimePoint<> MTime,
       Size(Size), Type(Type), Perms(Perms) {}
 
 Status Status::copyWithNewSize(const Status &In, uint64_t NewSize) {
-  return Status(In.getName(), In.getUniqueID(), In.getLastModificationTime(),
-                In.getUser(), In.getGroup(), NewSize, In.getType(),
-                In.getPermissions());
+  Status S = Status(In.getName(), In.getUniqueID(),
+                    In.getLastModificationTime(), In.getUser(), In.getGroup(),
+                    NewSize, In.getType(), In.getPermissions());
+  S.ExposesExternalVFSPath = In.ExposesExternalVFSPath;
+  return S;
 }
 
 Status Status::copyWithNewName(const Status &In, const Twine &NewName) {
-  return Status(NewName, In.getUniqueID(), In.getLastModificationTime(),
-                In.getUser(), In.getGroup(), In.getSize(), In.getType(),
-                In.getPermissions());
+  Status S = Status(NewName, In.getUniqueID(), In.getLastModificationTime(),
+                    In.getUser(), In.getGroup(), In.getSize(), In.getType(),
+                    In.getPermissions());
+  S.ExposesExternalVFSPath = In.ExposesExternalVFSPath;
+  return S;
 }
 
 Status Status::copyWithNewName(const file_status &In, const Twine &NewName) {
@@ -238,7 +242,6 @@ std::error_code RealFile::close() {
 }
 
 void RealFile::setPath(const Twine &Path) {
-  RealName = Path.str();
   if (auto Status = status())
     S = Status.get().copyWithNewName(Status.get(), Path);
 }
@@ -417,64 +420,127 @@ directory_iterator RealFileSystem::dir_begin(const Twine &Dir,
 //===-----------------------------------------------------------------------===/
 
 OverlayFileSystem::OverlayFileSystem(IntrusiveRefCntPtr<FileSystem> BaseFS) {
+  if (auto NewCWD = BaseFS->getCurrentWorkingDirectory())
+    CWD = *NewCWD;
   FSList.push_back(std::move(BaseFS));
 }
 
 void OverlayFileSystem::pushOverlay(IntrusiveRefCntPtr<FileSystem> FS) {
   FSList.push_back(FS);
-  // Synchronize added file systems by duplicating the working directory from
-  // the first one in the list.
-  FS->setCurrentWorkingDirectory(getCurrentWorkingDirectory().get());
 }
 
 ErrorOr<Status> OverlayFileSystem::status(const Twine &Path) {
   // FIXME: handle symlinks that cross file systems
-  for (iterator I = overlays_begin(), E = overlays_end(); I != E; ++I) {
-    ErrorOr<Status> Status = (*I)->status(Path);
-    if (Status || Status.getError() != llvm::errc::no_such_file_or_directory)
+
+  SmallString<256> AbsPath;
+  Path.toVector(AbsPath);
+  if (std::error_code EC = makeAbsolute(AbsPath))
+    return EC;
+
+  for (auto &FS : overlays_range()) {
+    ErrorOr<Status> Status = FS->status(AbsPath);
+    if (!Status) {
+      if (Status.getError() != errc::no_such_file_or_directory)
+        return Status;
+      continue;
+    }
+
+    // If the returned status had a different path to the one requested, just
+    // return it - the underlying FS mapped it to a different path, so we can't
+    // replace it. Otherwise, replace it with the originally requested path so
+    // that relative paths remain relative.
+    if (Status->ExposesExternalVFSPath)
       return Status;
+    return Status::copyWithNewName(*Status, Path);
   }
-  return make_error_code(llvm::errc::no_such_file_or_directory);
+  return errc::no_such_file_or_directory;
 }
 
 ErrorOr<std::unique_ptr<File>>
 OverlayFileSystem::openFileForRead(const llvm::Twine &Path) {
   // FIXME: handle symlinks that cross file systems
-  for (iterator I = overlays_begin(), E = overlays_end(); I != E; ++I) {
-    auto Result = (*I)->openFileForRead(Path);
-    if (Result || Result.getError() != llvm::errc::no_such_file_or_directory)
-      return Result;
+
+  SmallString<256> AbsPath;
+  Path.toVector(AbsPath);
+  if (std::error_code EC = makeAbsolute(AbsPath))
+    return EC;
+
+  for (auto &FS : overlays_range()) {
+    ErrorOr<std::unique_ptr<File>> Result = FS->openFileForRead(AbsPath);
+    if (!Result) {
+      if (Result.getError() != errc::no_such_file_or_directory)
+        return Result;
+      continue;
+    }
+
+    // See comment in OverlayFileSystem::status
+    if (ErrorOr<Status> Status = (*Result)->status()) {
+      if (Status->ExposesExternalVFSPath)
+        return Result;
+      return File::getWithPath(std::move(Result), Path);
+    }
   }
-  return make_error_code(llvm::errc::no_such_file_or_directory);
+  return errc::no_such_file_or_directory;
 }
 
-llvm::ErrorOr<std::string>
-OverlayFileSystem::getCurrentWorkingDirectory() const {
-  // All file systems are synchronized, just take the first working directory.
-  return FSList.front()->getCurrentWorkingDirectory();
+ErrorOr<std::string> OverlayFileSystem::getCurrentWorkingDirectory() const {
+  if (CWD.empty())
+    return errc::operation_not_permitted;
+  return CWD;
 }
 
 std::error_code
 OverlayFileSystem::setCurrentWorkingDirectory(const Twine &Path) {
-  for (auto &FS : FSList)
-    if (std::error_code EC = FS->setCurrentWorkingDirectory(Path))
-      return EC;
+  SmallString<256> AbsPath;
+  Path.toVector(AbsPath);
+  if (std::error_code EC = makeAbsolute(AbsPath))
+    return EC;
+
+  bool Success = false;
+  for (auto &FS : overlays_range()) {
+    if (auto Status = FS->status(AbsPath)) {
+      if (Status->isDirectory()) {
+        Success = true;
+        CWD = AbsPath.str().str();
+        break;
+      }
+    }
+  }
+
+  // Possible that all the filesystems could have failed with an unrelated
+  // error, but this seems the most reasonable error to return.
+  if (!Success)
+    return errc::no_such_file_or_directory;
   return {};
 }
 
 std::error_code OverlayFileSystem::isLocal(const Twine &Path, bool &Result) {
-  for (auto &FS : FSList)
-    if (FS->exists(Path))
-      return FS->isLocal(Path, Result);
+  SmallString<256> AbsPath;
+  Path.toVector(AbsPath);
+  if (std::error_code EC = makeAbsolute(AbsPath))
+    return EC;
+
+  for (auto &FS : overlays_range()) {
+    std::error_code EC = FS->isLocal(AbsPath, Result);
+    if (!EC || EC != errc::no_such_file_or_directory)
+      return EC;
+  }
   return errc::no_such_file_or_directory;
 }
 
 std::error_code
 OverlayFileSystem::getRealPath(const Twine &Path,
                                SmallVectorImpl<char> &Output) const {
-  for (const auto &FS : FSList)
-    if (FS->exists(Path))
-      return FS->getRealPath(Path, Output);
+  SmallString<256> AbsPath;
+  Path.toVector(AbsPath);
+  if (std::error_code EC = makeAbsolute(AbsPath))
+    return EC;
+
+  for (auto &FS : overlays_range()) {
+    std::error_code EC = FS->getRealPath(AbsPath, Output);
+    if (!EC || EC != errc::no_such_file_or_directory)
+      return EC;
+  }
   return errc::no_such_file_or_directory;
 }
 
@@ -1056,8 +1122,10 @@ std::error_code InMemoryFileSystem::setCurrentWorkingDirectory(const Twine &P) {
   if (useNormalizedPaths())
     llvm::sys::path::remove_dots(Path, /*remove_dot_dot=*/true);
 
-  if (!Path.empty())
-    WorkingDirectory = std::string(Path.str());
+  if (Path.empty())
+    return errc::no_such_file_or_directory;
+
+  WorkingDirectory = std::string(Path.str());
   return {};
 }
 
