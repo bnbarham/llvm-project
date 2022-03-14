@@ -26,13 +26,6 @@
         }
       ]
     },
-    { 'name': '/indirect-vfs-root-files', 'type': 'directory',
-      'contents': [
-        { 'name': 'actual_header.h', 'type': 'file',
-          'external-contents': 'TEST_DIR/Inputs/actual_header.h'
-        }
-      ]
-    },
     { 'name': 'TEST_DIR/Inputs/Broken.framework', 'type': 'directory',
       'contents': [
         { 'name': 'Headers/A.h', 'type': 'file',

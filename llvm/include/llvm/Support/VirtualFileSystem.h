@@ -581,13 +581,61 @@ protected:
 /// Get a globally unique ID for a virtual file or directory.
 llvm::sys::fs::UniqueID getNextVirtualUniqueID();
 
-/// Gets a \p FileSystem for a virtual file system described in YAML
-/// format.
+/// \see getVFSFromYAMLs
+///
+/// Returns nullptr if \p Buffer could not be parsed as a YAML containing
+/// overlay mappings.
 std::unique_ptr<FileSystem>
 getVFSFromYAML(std::unique_ptr<llvm::MemoryBuffer> Buffer,
                llvm::SourceMgr::DiagHandlerTy DiagHandler,
                StringRef YAMLFilePath, void *DiagContext = nullptr,
                IntrusiveRefCntPtr<FileSystem> ExternalFS = getRealFileSystem());
+
+/// Convenience function to read each file from \p ExternalFS and pass their
+/// buffers along to the next overload. Returns a \c FileError if any file
+/// could not be read.
+Expected<std::unique_ptr<OverlayFileSystem>>
+getVFSFromYAMLs(ArrayRef<StringRef> YAMLOverlayPaths,
+                IntrusiveRefCntPtr<FileSystem> ExternalFS = getRealFileSystem(),
+                SourceMgr::DiagHandlerTy DiagHandler = nullptr,
+                void *DiagContext = nullptr);
+
+/// Gets a \c FileSystem that runs operations on the virtual filesystems
+/// described by each buffer in \p Buffers and then the \p ExternalFS if those
+/// all fail (dependent on the options below). The order that each is run is
+/// the reverse of the list, ie. the last buffer creates the first used
+/// \c FileSystem.
+///
+/// Returns a \c FileError if any of the buffers are invalid and an
+/// \c OverlayFileSystem with just the \p ExternalFS if no buffers were
+/// provided.
+///
+/// Two extra root configuration options are handled by this method when
+/// parsing the YAML of each filesystem:
+///   'fallthrough': <boolean, default=true, deprecated - use 'redirecting-with'
+///                   instead>
+///   'redirecting-with': <string, one of 'fallthrough', 'fallback', or
+///                        'redirect-only', default='fallthrough'>
+///
+/// These specify the order each filesystem is added to an \c OverlayFileSystem
+/// and whether they're added at all -
+///   - 'fallthrough': allow "falling through" to the next filesystem
+///   - 'fallback': run opertions on the next filesystem before this one.
+///                 Most useful when specified on the first overlay, which
+///                 causes the \p ExternalFS to run before it (ie. "fallback"
+///                 to using the mapped paths only when original fails)
+///   - 'redirect-only': skip running operations on any further filesystems,
+///                      ie. this is the last used filesystem. As with
+///                      'fallback', this is more useful when specified on the
+///                      first overlay to avoid also checking the \p ExternalFS.
+///
+/// \see OverlayFileSystem
+/// \see RedirectingFileSystem
+Expected<std::unique_ptr<OverlayFileSystem>>
+getVFSFromYAMLs(ArrayRef<MemoryBufferRef> YAMLOverlays,
+                IntrusiveRefCntPtr<FileSystem> ExternalFS = getRealFileSystem(),
+                SourceMgr::DiagHandlerTy DiagHandler = nullptr,
+                void *DiagContext = nullptr);
 
 struct YAMLVFSEntry {
   template <typename T1, typename T2>
@@ -627,10 +675,6 @@ class RedirectingFileSystemParser;
 ///   'case-sensitive': <boolean, default=(true for Posix, false for Windows)>
 ///   'use-external-names': <boolean, default=true>
 ///   'overlay-relative': <boolean, default=false>
-///   'fallthrough': <boolean, default=true, deprecated - use 'redirecting-with'
-///                   instead>
-///   'redirecting-with': <string, one of 'fallthrough', 'fallback', or
-///                        'redirect-only', default='fallthrough'>
 ///
 /// Virtual directories that list their contents are represented as
 /// \verbatim
@@ -701,6 +745,11 @@ public:
   enum EntryKind { EK_Directory, EK_DirectoryRemap, EK_File };
   enum NameKind { NK_NotSet, NK_External, NK_Virtual };
 
+  // TODO: Simplify RedirectingFileSystem to remove redirection completely.
+  // Remove RedirectKind, Redirection, and all non-redirect-only paths. Require
+  // any old uses to move to using OverlayFileSystem instead (see the new
+  // getVFSFromYAMLs API).
+
   /// The type of redirection to perform.
   enum class RedirectKind {
     /// Lookup the redirected path first (ie. the one specified in
@@ -744,7 +793,7 @@ public:
     DirectoryEntry(StringRef Name, Status S)
         : Entry(EK_Directory, Name), S(std::move(S)) {}
 
-    Status getStatus() { return S; }
+    Status getStatus() const { return S; }
 
     void addContent(std::unique_ptr<Entry> Content) {
       Contents.push_back(std::move(Content));
@@ -880,11 +929,6 @@ private:
   /// The file system to use for external references.
   IntrusiveRefCntPtr<FileSystem> ExternalFS;
 
-  /// If IsRelativeOverlay is set, this represents the directory
-  /// path that should be prefixed to each 'external-contents' entry
-  /// when reading from YAML files.
-  std::string ExternalContentsPrefixDir;
-
   /// @name Configuration
   /// @{
 
@@ -892,10 +936,6 @@ private:
   ///
   /// Currently, case-insensitive matching only works correctly with ASCII.
   bool CaseSensitive = is_style_posix(sys::path::Style::native);
-
-  /// IsRelativeOverlay marks whether a ExternalContentsPrefixDir path must
-  /// be prefixed in every 'external-contents' when reading from YAML files.
-  bool IsRelativeOverlay = false;
 
   /// Whether to use to use the value of 'external-contents' for the
   /// names of files.  This global value is overridable on a per-file basis.
@@ -939,6 +979,7 @@ public:
          bool UseExternalNames, FileSystem &ExternalFS);
 
   ErrorOr<Status> status(const Twine &Path) override;
+
   ErrorOr<std::unique_ptr<File>> openFileForRead(const Twine &Path) override;
 
   std::error_code getRealPath(const Twine &Path,
@@ -953,10 +994,6 @@ public:
   std::error_code makeAbsolute(SmallVectorImpl<char> &Path) const override;
 
   directory_iterator dir_begin(const Twine &Dir, std::error_code &EC) override;
-
-  void setExternalContentsPrefixDir(StringRef PrefixDir);
-
-  StringRef getExternalContentsPrefixDir() const;
 
   /// Sets the redirection kind to \c Fallthrough if true or \c RedirectOnly
   /// otherwise. Will removed in the future, use \c setRedirection instead.

@@ -59,8 +59,7 @@ private:
 };
 
 /// Reproducer instance used to use an existing reproducer. The VFS returned by
-/// this instance is a RedirectingFileSystem that remaps paths to their
-/// counterpart in the reproducer.
+/// this instance remaps paths to their counterpart in the reproducer.
 class ReproducerUse : public Reproducer {
 public:
   ReproducerUse(StringRef Root, std::error_code &EC);

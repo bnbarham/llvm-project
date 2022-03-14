@@ -409,23 +409,19 @@ protected:
     switch (m_options.provider) {
     case eReproducerProviderFiles: {
       FileSpec vfs_mapping = loader->GetFile<FileProvider::Info>();
+      std::string overlay_path = vfs_mapping.GetPath();
 
-      // Read the VFS mapping.
-      ErrorOr<std::unique_ptr<MemoryBuffer>> buffer =
-          vfs::getRealFileSystem()->getBufferForFile(vfs_mapping.GetPath());
-      if (!buffer) {
-        SetError(result, errorCodeToError(buffer.getError()));
+      Expected<IntrusiveRefCntPtr<vfs::FileSystem>> vfs =
+          vfs::getVFSFromYAMLs(StringRef(overlay_path));
+      if (auto err = vfs.takeError()) {
+        SetError(result, std::move(err));
         return false;
       }
-
-      // Initialize a VFS from the given mapping.
-      IntrusiveRefCntPtr<vfs::FileSystem> vfs = vfs::getVFSFromYAML(
-          std::move(buffer.get()), nullptr, vfs_mapping.GetPath());
 
       // Dump the VFS to a buffer.
       std::string str;
       raw_string_ostream os(str);
-      static_cast<vfs::RedirectingFileSystem &>(*vfs).print(os);
+      (*vfs)->print(os);
       os.flush();
 
       // Return the string.

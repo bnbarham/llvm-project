@@ -4773,28 +4773,22 @@ IntrusiveRefCntPtr<llvm::vfs::FileSystem>
 clang::createVFSFromCompilerInvocation(
     const CompilerInvocation &CI, DiagnosticsEngine &Diags,
     IntrusiveRefCntPtr<llvm::vfs::FileSystem> BaseFS) {
-  if (CI.getHeaderSearchOpts().VFSOverlayFiles.empty())
+  ArrayRef<std::string> OptFiles = CI.getHeaderSearchOpts().VFSOverlayFiles;
+  if (OptFiles.empty())
     return BaseFS;
 
-  IntrusiveRefCntPtr<llvm::vfs::FileSystem> Result = BaseFS;
-  // earlier vfs files are on the bottom
-  for (const auto &File : CI.getHeaderSearchOpts().VFSOverlayFiles) {
-    llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> Buffer =
-        Result->getBufferForFile(File);
-    if (!Buffer) {
-      Diags.Report(diag::err_missing_vfs_overlay_file) << File;
-      continue;
-    }
-
-    IntrusiveRefCntPtr<llvm::vfs::FileSystem> FS = llvm::vfs::getVFSFromYAML(
-        std::move(Buffer.get()), /*DiagHandler*/ nullptr, File,
-        /*DiagContext*/ nullptr, Result);
-    if (!FS) {
-      Diags.Report(diag::err_invalid_vfs_overlay) << File;
-      continue;
-    }
-
-    Result = FS;
+  SmallVector<StringRef> Files(OptFiles.begin(), OptFiles.end());
+  Expected<IntrusiveRefCntPtr<llvm::vfs::FileSystem>> OverlayFS =
+      llvm::vfs::getVFSFromYAMLs(Files, BaseFS);
+  if (auto Err = OverlayFS.takeError()) {
+    llvm::handleAllErrors(std::move(Err), [&](const llvm::FileError &FE) {
+      if (FE.convertToErrorCode() == std::errc::no_such_file_or_directory) {
+        Diags.Report(diag::err_missing_vfs_overlay_file) << FE.getFileName();
+      } else {
+        Diags.Report(diag::err_invalid_vfs_overlay) << FE.getFileName();
+      }
+    });
+    return BaseFS;
   }
-  return Result;
+  return *OverlayFS;
 }

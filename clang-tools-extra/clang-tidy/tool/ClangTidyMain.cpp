@@ -363,26 +363,26 @@ static std::unique_ptr<ClangTidyOptionsProvider> createOptionsProvider(
       std::move(OverrideOptions), std::move(FS));
 }
 
-llvm::IntrusiveRefCntPtr<vfs::FileSystem>
-getVfsFromFile(const std::string &OverlayFile,
-               llvm::IntrusiveRefCntPtr<vfs::FileSystem> BaseFS) {
-  llvm::ErrorOr<std::unique_ptr<llvm::MemoryBuffer>> Buffer =
-      BaseFS->getBufferForFile(OverlayFile);
-  if (!Buffer) {
-    llvm::errs() << "Can't load virtual filesystem overlay file '"
-                 << OverlayFile << "': " << Buffer.getError().message()
-                 << ".\n";
-    return nullptr;
-  }
+static IntrusiveRefCntPtr<vfs::OverlayFileSystem>
+getVFSFromFile(StringRef OverlayFile) {
+  if (OverlayFile.empty())
+    return makeIntrusiveRefCnt<vfs::OverlayFileSystem>(
+        vfs::getRealFileSystem());
 
-  IntrusiveRefCntPtr<vfs::FileSystem> FS = vfs::getVFSFromYAML(
-      std::move(Buffer.get()), /*DiagHandler*/ nullptr, OverlayFile);
-  if (!FS) {
-    llvm::errs() << "Error: invalid virtual filesystem overlay file '"
-                 << OverlayFile << "'.\n";
+  auto OverlayFS = vfs::getVFSFromYAMLs(OverlayFile, vfs::getRealFileSystem());
+  if (auto Err = OverlayFS.takeError()) {
+    handleAllErrors(std::move(Err), [](const FileError &FE) {
+      if (FE.convertToErrorCode() == std::errc::no_such_file_or_directory) {
+        errs() << "Can't load virtual filesystem overlay file '"
+               << FE.getFileName() << "': " << FE.message() << ".\n";
+      } else {
+        errs() << "Error: invalid virtual filesystem overlay file '"
+               << FE.getFileName() << "'.\n";
+      }
+    });
     return nullptr;
   }
-  return FS;
+  return std::move(*OverlayFS);
 }
 
 int clangTidyMain(int argc, const char **argv) {
@@ -400,16 +400,10 @@ int clangTidyMain(int argc, const char **argv) {
     return 1;
   }
 
-  llvm::IntrusiveRefCntPtr<vfs::OverlayFileSystem> BaseFS(
-      new vfs::OverlayFileSystem(vfs::getRealFileSystem()));
-
-  if (!VfsOverlay.empty()) {
-    IntrusiveRefCntPtr<vfs::FileSystem> VfsFromFile =
-        getVfsFromFile(VfsOverlay, BaseFS);
-    if (!VfsFromFile)
-      return 1;
-    BaseFS->pushOverlay(std::move(VfsFromFile));
-  }
+  llvm::IntrusiveRefCntPtr<vfs::OverlayFileSystem> BaseFS =
+      getVFSFromFile(VfsOverlay);
+  if (!BaseFS)
+    return 1;
 
   auto OwningOptionsProvider = createOptionsProvider(BaseFS);
   auto *OptionsProvider = OwningOptionsProvider.get();

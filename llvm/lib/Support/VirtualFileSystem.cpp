@@ -1459,14 +1459,6 @@ directory_iterator RedirectingFileSystem::dir_begin(const Twine &Dir,
   return Combined;
 }
 
-void RedirectingFileSystem::setExternalContentsPrefixDir(StringRef PrefixDir) {
-  ExternalContentsPrefixDir = PrefixDir.str();
-}
-
-StringRef RedirectingFileSystem::getExternalContentsPrefixDir() const {
-  return ExternalContentsPrefixDir;
-}
-
 void RedirectingFileSystem::setFallthrough(bool Fallthrough) {
   if (Fallthrough) {
     Redirection = RedirectingFileSystem::RedirectKind::Fallthrough;
@@ -1540,6 +1532,41 @@ void RedirectingFileSystem::printEntry(raw_ostream &OS,
   }
 }
 
+namespace {
+
+struct YAMLParseResult {
+  /// The way in which this VFS should be added to an overlay. Note that the
+  /// order is right to left - given [A, B, C], any FS operations run on C
+  /// *first* and if failing, B, followed by A.
+  enum class RedirectKind {
+    /// Allow "falling through" to the next (ie. to the left) VFS.
+    Fallthrough,
+    /// Run any operations on the next VFS *first*, using this VFS as a
+    /// "fallback".
+    Fallback,
+    /// Do not perform any more operations on further VFS.
+    RedirectOnly
+  };
+
+  std::unique_ptr<RedirectingFileSystem> FS;
+  RedirectKind Redirection;
+
+  // TODO: Remove after simplifying RedirectingFileSystem
+  static RedirectingFileSystem::RedirectKind
+  toRFSKind(RedirectKind Redirection) {
+    switch (Redirection) {
+    case RedirectKind::Fallthrough:
+      return RedirectingFileSystem::RedirectKind::Fallthrough;
+    case RedirectKind::Fallback:
+      return RedirectingFileSystem::RedirectKind::Fallback;
+    case RedirectKind::RedirectOnly:
+      return RedirectingFileSystem::RedirectKind::RedirectOnly;
+    }
+  }
+};
+
+} // namespace
+
 /// A helper class to hold the common YAML parsing state.
 class llvm::vfs::RedirectingFileSystemParser {
   yaml::Stream &Stream;
@@ -1581,19 +1608,18 @@ class llvm::vfs::RedirectingFileSystemParser {
     return false;
   }
 
-  Optional<RedirectingFileSystem::RedirectKind>
-  parseRedirectKind(yaml::Node *N) {
+  Optional<YAMLParseResult::RedirectKind> parseRedirectKind(yaml::Node *N) {
     SmallString<12> Storage;
     StringRef Value;
     if (!parseScalarString(N, Value, Storage))
       return None;
 
     if (Value.equals_insensitive("fallthrough")) {
-      return RedirectingFileSystem::RedirectKind::Fallthrough;
+      return YAMLParseResult::RedirectKind::Fallthrough;
     } else if (Value.equals_insensitive("fallback")) {
-      return RedirectingFileSystem::RedirectKind::Fallback;
+      return YAMLParseResult::RedirectKind::Fallback;
     } else if (Value.equals_insensitive("redirect-only")) {
-      return RedirectingFileSystem::RedirectKind::RedirectOnly;
+      return YAMLParseResult::RedirectKind::RedirectOnly;
     }
     return None;
   }
@@ -1636,10 +1662,10 @@ class llvm::vfs::RedirectingFileSystemParser {
 
 public:
   static RedirectingFileSystem::Entry *
-  lookupOrCreateEntry(RedirectingFileSystem *FS, StringRef Name,
+  lookupOrCreateEntry(RedirectingFileSystem &FS, StringRef Name,
                       RedirectingFileSystem::Entry *ParentEntry = nullptr) {
     if (!ParentEntry) { // Look for a existent root
-      for (const auto &Root : FS->Roots) {
+      for (const auto &Root : FS.Roots) {
         if (Name.equals(Root->getName())) {
           ParentEntry = Root.get();
           return ParentEntry;
@@ -1664,8 +1690,8 @@ public:
                          file_type::directory_file, sys::fs::all_all));
 
     if (!ParentEntry) { // Add a new root to the overlay
-      FS->Roots.push_back(std::move(E));
-      ParentEntry = FS->Roots.back().get();
+      FS.Roots.push_back(std::move(E));
+      ParentEntry = FS.Roots.back().get();
       return ParentEntry;
     }
 
@@ -1675,7 +1701,7 @@ public:
   }
 
 private:
-  void uniqueOverlayTree(RedirectingFileSystem *FS,
+  void uniqueOverlayTree(RedirectingFileSystem &FS,
                          RedirectingFileSystem::Entry *SrcE,
                          RedirectingFileSystem::Entry *NewParentE = nullptr) {
     StringRef Name = SrcE->getName();
@@ -1713,7 +1739,8 @@ private:
   }
 
   std::unique_ptr<RedirectingFileSystem::Entry>
-  parseEntry(yaml::Node *N, RedirectingFileSystem *FS, bool IsRootEntry) {
+  parseEntry(yaml::Node *N, StringRef CWD, bool IsRelativeOverlay,
+             StringRef ExternalContentsPrefixDir, bool IsRootEntry) {
     auto *M = dyn_cast<yaml::MappingNode>(N);
     if (!M) {
       error(N, "expected mapping node for file or directory entry");
@@ -1788,7 +1815,9 @@ private:
 
         for (auto &I : *Contents) {
           if (std::unique_ptr<RedirectingFileSystem::Entry> E =
-                  parseEntry(&I, FS, /*IsRootEntry*/ false))
+                  parseEntry(&I, CWD, IsRelativeOverlay,
+                             ExternalContentsPrefixDir,
+                             /*IsRootEntry=*/false))
             EntryArrayContents.push_back(std::move(E));
           else
             return nullptr;
@@ -1804,14 +1833,14 @@ private:
           return nullptr;
 
         SmallString<256> FullPath;
-        if (FS->IsRelativeOverlay) {
-          FullPath = FS->getExternalContentsPrefixDir();
+        if (IsRelativeOverlay) {
+          FullPath.append(ExternalContentsPrefixDir);
           assert(!FullPath.empty() &&
                  "External contents prefix directory must exist");
-          llvm::sys::path::append(FullPath, Value);
-        } else {
-          FullPath = Value;
+        } else if (llvm::sys::path::is_relative(Value)) {
+          FullPath.append(CWD);
         }
+        llvm::sys::path::append(FullPath, Value);
 
         // Guarantee that old YAML files containing paths with ".." and "."
         // are properly canonicalized before read into the VFS.
@@ -1927,12 +1956,45 @@ private:
 public:
   RedirectingFileSystemParser(yaml::Stream &S) : Stream(S) {}
 
-  // false on error
-  bool parse(yaml::Node *Root, RedirectingFileSystem *FS) {
+  static Optional<YAMLParseResult>
+  parse(MemoryBufferRef Buffer, SourceMgr &SM,
+        IntrusiveRefCntPtr<FileSystem> ExternalFS) {
+    yaml::Stream Stream(Buffer, SM);
+    yaml::document_iterator DI = Stream.begin();
+    yaml::Node *Root = DI->getRoot();
+    if (DI == Stream.end() || !Root) {
+      SM.PrintMessage(SMLoc(), SourceMgr::DK_Error, "expected root node");
+      return None;
+    }
+
+    SmallString<256> ExternalContentsPrefixDir;
+    if (!Buffer.getBufferIdentifier().empty()) {
+      // Use the YAML path from -ivfsoverlay to compute the dir to be prefixed
+      // to each 'external-contents' path.
+      //
+      // Example:
+      //    -ivfsoverlay dummy.cache/vfs/vfs.yaml
+      // yields:
+      //  FS->ExternalContentsPrefixDir => /<absolute_path_to>/dummy.cache/vfs
+      //
+      ExternalContentsPrefixDir =
+          sys::path::parent_path(Buffer.getBufferIdentifier());
+      std::error_code EC = ExternalFS->makeAbsolute(ExternalContentsPrefixDir);
+      assert(!EC && "Overlay dir final path must be absolute");
+      (void)EC;
+    }
+
+    RedirectingFileSystemParser P(Stream);
+    return P.parse(Root, ExternalContentsPrefixDir, std::move(ExternalFS));
+  }
+
+  Optional<YAMLParseResult> parse(yaml::Node *Root,
+                                  StringRef ExternalContentsPrefixDir,
+                                  IntrusiveRefCntPtr<FileSystem> ExternalFS) {
     auto *Top = dyn_cast<yaml::MappingNode>(Root);
     if (!Top) {
       error(Root, "expected mapping node");
-      return false;
+      return None;
     }
 
     KeyStatusPair Fields[] = {
@@ -1948,85 +2010,105 @@ public:
     DenseMap<StringRef, KeyStatus> Keys(std::begin(Fields), std::end(Fields));
     std::vector<std::unique_ptr<RedirectingFileSystem::Entry>> RootEntries;
 
+    bool IsRelativeOverlay = false;
+    YAMLParseResult Result{std::unique_ptr<RedirectingFileSystem>(
+                               new RedirectingFileSystem(ExternalFS)),
+                           YAMLParseResult::RedirectKind::Fallthrough};
+    std::string CWD;
+    if (auto CWDOrError = ExternalFS->getCurrentWorkingDirectory()) {
+      CWD = *CWDOrError;
+      Result.FS->setCurrentWorkingDirectory(CWD);
+    }
+
     // Parse configuration and 'roots'
     for (auto &I : *Top) {
       SmallString<10> KeyBuffer;
       StringRef Key;
       if (!parseScalarString(I.getKey(), Key, KeyBuffer))
-        return false;
+        return None;
 
       if (!checkDuplicateOrUnknownKey(I.getKey(), Key, Keys))
-        return false;
+        return None;
 
       if (Key == "roots") {
         auto *Roots = dyn_cast<yaml::SequenceNode>(I.getValue());
         if (!Roots) {
           error(I.getValue(), "expected array");
-          return false;
+          return None;
         }
 
         for (auto &I : *Roots) {
           if (std::unique_ptr<RedirectingFileSystem::Entry> E =
-                  parseEntry(&I, FS, /*IsRootEntry*/ true))
+                  parseEntry(&I, CWD, IsRelativeOverlay,
+                             ExternalContentsPrefixDir,
+                             /*IsRootEntry=*/true))
             RootEntries.push_back(std::move(E));
           else
-            return false;
+            return None;
         }
       } else if (Key == "version") {
         StringRef VersionString;
         SmallString<4> Storage;
         if (!parseScalarString(I.getValue(), VersionString, Storage))
-          return false;
+          return None;
         int Version;
         if (VersionString.getAsInteger<int>(10, Version)) {
           error(I.getValue(), "expected integer");
-          return false;
+          return None;
         }
         if (Version < 0) {
           error(I.getValue(), "invalid version number");
-          return false;
+          return None;
         }
         if (Version != 0) {
           error(I.getValue(), "version mismatch, expected 0");
-          return false;
+          return None;
         }
       } else if (Key == "case-sensitive") {
-        if (!parseScalarBool(I.getValue(), FS->CaseSensitive))
-          return false;
+        if (!parseScalarBool(I.getValue(), Result.FS->CaseSensitive))
+          return None;
       } else if (Key == "overlay-relative") {
-        if (!parseScalarBool(I.getValue(), FS->IsRelativeOverlay))
-          return false;
+        if (!parseScalarBool(I.getValue(), IsRelativeOverlay))
+          return None;
       } else if (Key == "use-external-names") {
-        if (!parseScalarBool(I.getValue(), FS->UseExternalNames))
-          return false;
+        if (!parseScalarBool(I.getValue(), Result.FS->UseExternalNames))
+          return None;
       } else if (Key == "fallthrough") {
         if (Keys["redirecting-with"].Seen) {
           error(I.getValue(),
                 "'fallthrough' and 'redirecting-with' are mutually exclusive");
-          return false;
+          return None;
         }
 
         bool ShouldFallthrough = false;
         if (!parseScalarBool(I.getValue(), ShouldFallthrough))
-          return false;
+          return None;
 
         if (ShouldFallthrough) {
-          FS->Redirection = RedirectingFileSystem::RedirectKind::Fallthrough;
+          Result.Redirection = YAMLParseResult::RedirectKind::Fallthrough;
+          // TODO: Remove after simplifying RedirectingFileSystem
+          Result.FS->Redirection =
+              RedirectingFileSystem::RedirectKind::Fallthrough;
         } else {
-          FS->Redirection = RedirectingFileSystem::RedirectKind::RedirectOnly;
+          Result.Redirection = YAMLParseResult::RedirectKind::RedirectOnly;
+          // TODO: Remove after simplifying RedirectingFileSystem
+          Result.FS->Redirection =
+              RedirectingFileSystem::RedirectKind::RedirectOnly;
         }
       } else if (Key == "redirecting-with") {
         if (Keys["fallthrough"].Seen) {
           error(I.getValue(),
                 "'fallthrough' and 'redirecting-with' are mutually exclusive");
-          return false;
+          return None;
         }
 
         if (auto Kind = parseRedirectKind(I.getValue())) {
-          FS->Redirection = *Kind;
+          Result.Redirection = *Kind;
+          // TODO: Remove after simplifying RedirectingFileSystem
+          Result.FS->Redirection = YAMLParseResult::toRFSKind(*Kind);
         } else {
           error(I.getValue(), "expected valid redirect kind");
-          return false;
+          return None;
         }
       } else {
         llvm_unreachable("key missing from Keys");
@@ -2034,18 +2116,18 @@ public:
     }
 
     if (Stream.failed())
-      return false;
+      return None;
 
     if (!checkMissingKeys(Top, Keys))
-      return false;
+      return None;
 
     // Now that we sucessefully parsed the YAML file, canonicalize the internal
     // representation to a proper directory tree so that we can search faster
     // inside the VFS.
     for (auto &E : RootEntries)
-      uniqueOverlayTree(FS, E.get());
+      uniqueOverlayTree(*Result.FS, E.get());
 
-    return true;
+    return Result;
   }
 };
 
@@ -2055,41 +2137,12 @@ RedirectingFileSystem::create(std::unique_ptr<MemoryBuffer> Buffer,
                               StringRef YAMLFilePath, void *DiagContext,
                               IntrusiveRefCntPtr<FileSystem> ExternalFS) {
   SourceMgr SM;
-  yaml::Stream Stream(Buffer->getMemBufferRef(), SM);
-
   SM.setDiagHandler(DiagHandler, DiagContext);
-  yaml::document_iterator DI = Stream.begin();
-  yaml::Node *Root = DI->getRoot();
-  if (DI == Stream.end() || !Root) {
-    SM.PrintMessage(SMLoc(), SourceMgr::DK_Error, "expected root node");
-    return nullptr;
-  }
 
-  RedirectingFileSystemParser P(Stream);
-
-  std::unique_ptr<RedirectingFileSystem> FS(
-      new RedirectingFileSystem(ExternalFS));
-
-  if (!YAMLFilePath.empty()) {
-    // Use the YAML path from -ivfsoverlay to compute the dir to be prefixed
-    // to each 'external-contents' path.
-    //
-    // Example:
-    //    -ivfsoverlay dummy.cache/vfs/vfs.yaml
-    // yields:
-    //  FS->ExternalContentsPrefixDir => /<absolute_path_to>/dummy.cache/vfs
-    //
-    SmallString<256> OverlayAbsDir = sys::path::parent_path(YAMLFilePath);
-    std::error_code EC = llvm::sys::fs::make_absolute(OverlayAbsDir);
-    assert(!EC && "Overlay dir final path must be absolute");
-    (void)EC;
-    FS->setExternalContentsPrefixDir(OverlayAbsDir);
-  }
-
-  if (!P.parse(Root, FS.get()))
-    return nullptr;
-
-  return FS;
+  if (Optional<YAMLParseResult> Result = RedirectingFileSystemParser::parse(
+          Buffer->getMemBufferRef(), SM, std::move(ExternalFS)))
+    return std::move(Result->FS);
+  return nullptr;
 }
 
 std::unique_ptr<RedirectingFileSystem> RedirectingFileSystem::create(
@@ -2122,8 +2175,8 @@ std::unique_ptr<RedirectingFileSystem> RedirectingFileSystem::create(
     for (auto I = llvm::sys::path::begin(FromDirectory),
               E = llvm::sys::path::end(FromDirectory);
          I != E; ++I) {
-      Parent = RedirectingFileSystemParser::lookupOrCreateEntry(FS.get(), *I,
-                                                                Parent);
+      Parent =
+          RedirectingFileSystemParser::lookupOrCreateEntry(*FS, *I, Parent);
     }
     assert(Parent && "File without a directory?");
     {
@@ -2325,8 +2378,8 @@ public:
       : InnerFile(std::move(InnerFile)), S(std::move(S)) {}
 
   ErrorOr<Status> status() override { return S; }
-  ErrorOr<std::unique_ptr<llvm::MemoryBuffer>>
 
+  ErrorOr<std::unique_ptr<llvm::MemoryBuffer>>
   getBuffer(const Twine &Name, int64_t FileSize, bool RequiresNullTerminator,
             bool IsVolatile) override {
     return InnerFile->getBuffer(Name, FileSize, RequiresNullTerminator,
@@ -2473,9 +2526,135 @@ vfs::getVFSFromYAML(std::unique_ptr<MemoryBuffer> Buffer,
                     SourceMgr::DiagHandlerTy DiagHandler,
                     StringRef YAMLFilePath, void *DiagContext,
                     IntrusiveRefCntPtr<FileSystem> ExternalFS) {
-  return RedirectingFileSystem::create(std::move(Buffer), DiagHandler,
-                                       YAMLFilePath, DiagContext,
-                                       std::move(ExternalFS));
+  MemoryBufferRef BufferRef{Buffer->getBuffer(), YAMLFilePath};
+  auto FS = getVFSFromYAMLs(BufferRef, ExternalFS, DiagHandler, DiagContext);
+  if (auto Err = FS.takeError()) {
+    consumeError(std::move(Err));
+    return nullptr;
+  }
+  return std::move(*FS);
+}
+
+namespace {
+
+struct VFSResult {
+  IntrusiveRefCntPtr<FileSystem> FS;
+  YAMLParseResult::RedirectKind Redirection;
+
+  VFSResult(IntrusiveRefCntPtr<FileSystem> FS,
+            YAMLParseResult::RedirectKind Redirection)
+      : FS(std::move(FS)), Redirection(Redirection) {}
+
+  VFSResult(YAMLParseResult &Result)
+      : FS(std::move(Result.FS)), Redirection(Result.Redirection) {}
+};
+
+} // namespace
+
+static std::unique_ptr<OverlayFileSystem>
+createOverlay(ArrayRef<VFSResult> VFSResults) {
+  if (VFSResults.empty())
+    return nullptr;
+
+  auto OverlayFS = std::make_unique<OverlayFileSystem>(VFSResults.front().FS);
+  for (const auto &Result : VFSResults.drop_front()) {
+    OverlayFS->pushOverlay(Result.FS);
+  }
+  return OverlayFS;
+}
+
+Expected<std::unique_ptr<OverlayFileSystem>>
+vfs::getVFSFromYAMLs(ArrayRef<StringRef> YAMLOverlayPaths,
+                     IntrusiveRefCntPtr<FileSystem> ExternalFS,
+                     SourceMgr::DiagHandlerTy DiagHandler, void *DiagContext) {
+  SmallVector<MemoryBufferRef, 2> BufferRefs;
+  for (StringRef Path : YAMLOverlayPaths) {
+    BufferRefs.emplace_back(StringRef(), Path);
+  }
+  return getVFSFromYAMLs(BufferRefs, std::move(ExternalFS), DiagHandler,
+                         DiagContext);
+}
+
+Expected<std::unique_ptr<OverlayFileSystem>>
+vfs::getVFSFromYAMLs(ArrayRef<MemoryBufferRef> YAMLOverlays,
+                     IntrusiveRefCntPtr<FileSystem> ExternalFS,
+                     SourceMgr::DiagHandlerTy DiagHandler, void *DiagContext) {
+  if (YAMLOverlays.empty())
+    return std::make_unique<OverlayFileSystem>(std::move(ExternalFS));
+
+  SourceMgr SM;
+  SM.setDiagHandler(DiagHandler, DiagContext);
+
+  SmallVector<VFSResult, 2> Overlays;
+  Overlays.emplace_back(ExternalFS, YAMLParseResult::RedirectKind::Fallthrough);
+  std::unique_ptr<OverlayFileSystem> OverlayFS = createOverlay(Overlays);
+
+  for (MemoryBufferRef Buffer : YAMLOverlays) {
+    // Bit of a hack. If the buffer's data is a nullptr (not just empty),
+    // attempt to read the the file from the current FS. This is to
+    // differentiate between an actual buffer and one that was made from just
+    // a path. The paths cannot be read all up front in order to support
+    // overlay files being defined in a VFS.
+    std::unique_ptr<MemoryBuffer> TempBuffer;
+    if (Buffer.getBuffer().data() == nullptr) {
+      ErrorOr<std::unique_ptr<MemoryBuffer>> NewBufferOrError =
+          OverlayFS->getBufferForFile(Buffer.getBufferIdentifier());
+      if (!NewBufferOrError)
+        return createFileError(Buffer.getBufferIdentifier(),
+                               NewBufferOrError.getError());
+      TempBuffer = std::move(*NewBufferOrError);
+      Buffer = MemoryBufferRef(TempBuffer->getBuffer(),
+                               Buffer.getBufferIdentifier());
+    }
+
+    Optional<YAMLParseResult> Result =
+        RedirectingFileSystemParser::parse(Buffer, SM, ExternalFS);
+    if (!Result)
+      return createFileError(Buffer.getBufferIdentifier(),
+                             llvm::errc::invalid_argument);
+
+    // TODO: Remove after simplifying RedirectingFileSystem
+    Result->FS->setRedirection(
+        RedirectingFileSystem::RedirectKind::RedirectOnly);
+    switch (Result->Redirection) {
+    case YAMLParseResult::RedirectKind::Fallthrough:
+      // Simple case - add on the FS
+      Overlays.emplace_back(*Result);
+      OverlayFS->pushOverlay(Overlays.back().FS);
+      break;
+    case YAMLParseResult::RedirectKind::Fallback:
+      // Fallback implies that the previously added FS should run operations
+      // before hitting this FS. This doesn't make a whole lot of sense for any
+      // position other than the beginning where we want the external FS to run
+      // first. For other positions the overlays could just be specified in the
+      // opposite order.
+      //
+      // This is fallout from the history of \c RedirectingFileSystem. Ideally
+      // we would just depend on order and have some way to specify the real
+      // filesystem.
+
+      if (Overlays.back().Redirection !=
+          YAMLParseResult::RedirectKind::RedirectOnly) {
+        // If the previously inserted overlay is redirect only, don't bother
+        // adding this one - it would never run anyway (since redirect only
+        // is necessarily the last FS).
+
+        // Note: Overlays is never empty, it always has at least the
+        // \c ExternalFS
+        Overlays.insert(Overlays.end() - 1, VFSResult(*Result));
+        OverlayFS = createOverlay(Overlays);
+      }
+      break;
+    case YAMLParseResult::RedirectKind::RedirectOnly:
+      // This is now the last FS, clear the rest if there were any
+      Overlays.clear();
+      Overlays.emplace_back(*Result);
+      OverlayFS = createOverlay(Overlays);
+      break;
+    }
+  }
+
+  return OverlayFS;
 }
 
 static void getVFSEntries(RedirectingFileSystem::Entry *SrcE,

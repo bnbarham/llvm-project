@@ -14,6 +14,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Testing/Support/Error.h"
 #include "llvm/Testing/Support/SupportHelpers.h"
 #include "gmock/gmock.h"
 #include "gtest/gtest.h"
@@ -2572,7 +2573,7 @@ TEST_F(VFSFromYAMLTest, GetRealPath) {
 }
 
 TEST_F(VFSFromYAMLTest, WorkingDirectory) {
-  IntrusiveRefCntPtr<DummyFileSystem> Lower(new DummyFileSystem());
+  IntrusiveRefCntPtr<ErrorDummyFileSystem> Lower(new ErrorDummyFileSystem());
   Lower->addDirectory("//root/");
   Lower->addDirectory("//root/foo");
   Lower->addRegularFile("//root/foo/a");
@@ -2594,6 +2595,7 @@ TEST_F(VFSFromYAMLTest, WorkingDirectory) {
       "}",
       Lower);
   ASSERT_NE(FS.get(), nullptr);
+
   std::error_code EC = FS->setCurrentWorkingDirectory("//root/bar");
   ASSERT_FALSE(EC);
 
@@ -2621,6 +2623,14 @@ TEST_F(VFSFromYAMLTest, WorkingDirectory) {
   WorkingDir = FS->getCurrentWorkingDirectory();
   ASSERT_TRUE(WorkingDir);
   EXPECT_EQ(*WorkingDir, "//root/");
+
+  Status = FS->status("bar/a");
+  ASSERT_FALSE(Status.getError());
+  EXPECT_TRUE(Status->exists());
+
+  Status = FS->status("foo/a");
+  ASSERT_FALSE(Status.getError());
+  EXPECT_TRUE(Status->exists());
 
   EC = FS->setCurrentWorkingDirectory("bar");
   ASSERT_FALSE(EC);
@@ -2707,43 +2717,6 @@ TEST_F(VFSFromYAMLTest, WorkingDirectoryFallthrough) {
   EXPECT_TRUE(Status->exists());
 
   Status = FS->status("../bar/baz/a");
-  ASSERT_FALSE(Status.getError());
-  EXPECT_TRUE(Status->exists());
-}
-
-TEST_F(VFSFromYAMLTest, WorkingDirectoryFallthroughInvalid) {
-  IntrusiveRefCntPtr<ErrorDummyFileSystem> Lower(new ErrorDummyFileSystem());
-  Lower->addDirectory("//root/");
-  Lower->addDirectory("//root/foo");
-  Lower->addRegularFile("//root/foo/a");
-  Lower->addRegularFile("//root/foo/b");
-  Lower->addRegularFile("//root/c");
-  IntrusiveRefCntPtr<vfs::FileSystem> FS = getFromYAMLString(
-      "{ 'use-external-names': false,\n"
-      "  'roots': [\n"
-      "{\n"
-      "  'type': 'directory',\n"
-      "  'name': '//root/bar',\n"
-      "  'contents': [ {\n"
-      "                  'type': 'file',\n"
-      "                  'name': 'a',\n"
-      "                  'external-contents': '//root/foo/a'\n"
-      "                }\n"
-      "              ]\n"
-      "}\n"
-      "]\n"
-      "}",
-      Lower);
-  ASSERT_NE(FS.get(), nullptr);
-  std::error_code EC = FS->setCurrentWorkingDirectory("//root/");
-  ASSERT_FALSE(EC);
-  ASSERT_NE(FS.get(), nullptr);
-
-  llvm::ErrorOr<vfs::Status> Status = FS->status("bar/a");
-  ASSERT_FALSE(Status.getError());
-  EXPECT_TRUE(Status->exists());
-
-  Status = FS->status("foo/a");
   ASSERT_FALSE(Status.getError());
   EXPECT_TRUE(Status->exists());
 }
@@ -3207,4 +3180,238 @@ TEST(RedirectingFileSystemTest, PrintOutput) {
             "ExternalFS:\n"
             "  DummyFileSystem (RecursiveContents)\n",
             Output);
+}
+
+// Check any relative external contents paths are resolved when the
+// RedirectingFS is created.
+TEST(RedirectingFileSystemTest, RelativeResolvedAtCreation) {
+  auto Real = makeIntrusiveRefCnt<DummyFileSystem>();
+  Real->addDirectory("/real");
+  Real->addRegularFile("/real/f");
+  Real->addDirectory("/other");
+  Real->addRegularFile("/other/f");
+  Real->setCurrentWorkingDirectory("/real");
+
+  auto Buffer =
+      MemoryBuffer::getMemBuffer("{\n"
+                                 "  'version': 0,\n"
+                                 "  'roots': [\n"
+                                 "    {\n"
+                                 "      'type': 'directory',\n"
+                                 "      'name': '/a',\n"
+                                 "      'contents': ["
+                                 "        {\n"
+                                 "          'type': 'file',\n"
+                                 "          'name': 'b',\n"
+                                 "          'external-contents': 'f'\n"
+                                 "        }]\n"
+                                 "    }]\n"
+                                 "}", "/real/vfs.yaml");
+  auto FS = vfs::RedirectingFileSystem::create(
+      std::move(Buffer), nullptr, "", nullptr, Real);
+  ASSERT_TRUE(FS);
+
+  EXPECT_PATHS(*FS, "/a/b", "/real/f", "/real/f");
+  FS->setCurrentWorkingDirectory("/other");
+  EXPECT_PATHS(*FS, "/a/b", "/real/f", "/real/f");
+}
+
+// Check any relative external contents paths are resolved using the
+// ExternalContentsPrefixPath if the overlay has overlay-relative set.
+TEST(RedirectingFileSystemTest, IsRelativeIgnoresCWD) {
+  auto Real = makeIntrusiveRefCnt<DummyFileSystem>();
+  Real->addDirectory("/real");
+  Real->addRegularFile("/real/f");
+  Real->addDirectory("/other");
+  Real->addRegularFile("/other/f");
+  Real->setCurrentWorkingDirectory("/other");
+
+  auto Buffer =
+      MemoryBuffer::getMemBuffer("{\n"
+                                 "  'version': 0,\n"
+                                 "  'overlay-relative': true,\n"
+                                 "  'roots': [\n"
+                                 "    {\n"
+                                 "      'type': 'directory',\n"
+                                 "      'name': '/a',\n"
+                                 "      'contents': ["
+                                 "        {\n"
+                                 "          'type': 'file',\n"
+                                 "          'name': 'b',\n"
+                                 "          'external-contents': 'f'\n"
+                                 "        }]\n"
+                                 "    }]\n"
+                                 "}", "/real/vfs.yaml");
+  auto FS = vfs::RedirectingFileSystem::create(
+      std::move(Buffer), nullptr, "", nullptr, Real);
+  ASSERT_TRUE(FS);
+
+  EXPECT_PATHS(*FS, "/a/b", "/real/f", "/real/f");
+  FS->setCurrentWorkingDirectory("/other2");
+  EXPECT_PATHS(*FS, "/a/b", "/real/f", "/real/f");
+}
+
+static std::unique_ptr<vfs::OverlayFileSystem>
+getVFSOrNull(ArrayRef<std::string> YAMLOverlays,
+             IntrusiveRefCntPtr<vfs::FileSystem> ExternalFS) {
+  SmallVector<MemoryBufferRef> OverlayRefs;
+  for (const auto &Overlay : YAMLOverlays) {
+    OverlayRefs.emplace_back(Overlay, "");
+  }
+
+  auto ExpectedFS = vfs::getVFSFromYAMLs(OverlayRefs, ExternalFS);
+  if (auto Err = ExpectedFS.takeError()) {
+    consumeError(std::move(Err));
+    return nullptr;
+  }
+  return std::move(*ExpectedFS);
+}
+
+static std::string createSimpleOverlay(StringRef RedirectKind, StringRef From,
+                                       StringRef To) {
+  return ("{\n"
+          "  'version': 0,\n"
+          "  'redirecting-with': '" +
+          RedirectKind +
+          "'\n"
+          "  'roots': [\n"
+          "     {\n"
+          "       'type': 'directory-remap',\n"
+          "       'name': '" +
+          From +
+          "',\n"
+          "       'external-contents': '" +
+          To +
+          "',\n"
+          "       }]\n"
+          "     }"
+          "  ]")
+      .str();
+}
+
+// Make sure that overlays are not transitive. Given A -> B and B -> C, if a
+// file in A is requested, it should not end up mapping to C.
+TEST(VFSFromYAMLsTest, NotTransitive) {
+  auto C = makeIntrusiveRefCnt<DummyFileSystem>();
+  C->addDirectory("/real/c");
+  C->addRegularFile("/real/c/f");
+
+  SmallVector<std::string> Overlays;
+  Overlays.push_back(createSimpleOverlay("fallthrough", "/b", "/real/c"));
+  Overlays.push_back(createSimpleOverlay("fallthrough", "/a", "/b"));
+  auto FS = getVFSOrNull(Overlays, C);
+  ASSERT_TRUE(FS);
+
+  EXPECT_PATHS(*FS, "/b/f", "/real/c/f", "/real/c/f");
+  auto S = FS->status("/b/f");
+  ASSERT_FALSE(S.getError());
+  EXPECT_EQ("/real/c/f", S->getName());
+
+  EXPECT_TRUE(FS->status("/a/f").getError());
+}
+
+// When fallback is the first overlay, the external FS should be checked before
+// it. Given B -> A, A should only be used if the file does not exist in B.
+TEST(VFSFromYAMLsTest, FallbackChecksExternalFirst) {
+  auto AOnly = makeIntrusiveRefCnt<DummyFileSystem>();
+  AOnly->addDirectory("/a");
+  AOnly->addRegularFile("/a/f");
+
+  auto BOnly = makeIntrusiveRefCnt<DummyFileSystem>();
+  BOnly->addDirectory("/b");
+  BOnly->addRegularFile("/b/f");
+
+  auto Both = makeIntrusiveRefCnt<DummyFileSystem>();
+  Both->addDirectory("/a");
+  Both->addRegularFile("/a/f");
+  Both->addDirectory("/b");
+  Both->addRegularFile("/b/f");
+
+  auto FallbackOverlay = createSimpleOverlay("fallback", "/b", "/a");
+
+  auto FS = getVFSOrNull(FallbackOverlay, AOnly);
+  ASSERT_TRUE(FS);
+  EXPECT_PATHS(*FS, "/b/f", "/a/f", "/a/f");
+
+  FS = getVFSOrNull(FallbackOverlay, BOnly);
+  ASSERT_TRUE(FS);
+  EXPECT_PATHS(*FS, "/b/f", "/b/f", "/b/f");
+
+  FS = getVFSOrNull(FallbackOverlay, Both);
+  ASSERT_TRUE(FS);
+  EXPECT_PATHS(*FS, "/b/f", "/b/f", "/b/f");
+}
+
+// Ensure the last overlay with redirect-only specified is the final FS
+TEST(VFSFromYAMLsTest, RedirectOnlyIsFinalFS) {
+  auto Real = makeIntrusiveRefCnt<DummyFileSystem>();
+  Real->addDirectory("/real");
+  Real->addRegularFile("/real/f");
+  Real->setCurrentWorkingDirectory("/real");
+
+  SmallVector<std::string> Overlays;
+  Overlays.push_back(createSimpleOverlay("redirect-only", "/ro1", "/real"));
+  Overlays.push_back(createSimpleOverlay("fallthrough", "/ft1", "/real"));
+  Overlays.push_back(createSimpleOverlay("redirect-only", "/ro2", "/real"));
+  Overlays.push_back(createSimpleOverlay("fallback", "/fb", "/real"));
+  Overlays.push_back(createSimpleOverlay("fallthrough", "/ft2", "/real"));
+  auto FS = getVFSOrNull(Overlays, Real);
+  ASSERT_TRUE(FS);
+
+  // Should have the same CWD as the external FS we passed down, even if that
+  // FS isn't actually being used in the overlay any more.
+  auto CWD = FS->getCurrentWorkingDirectory();
+  ASSERT_FALSE(CWD.getError());
+  EXPECT_EQ(*CWD, "/real");
+
+  // Only //ft2/f and //ro2/f should be valid:
+  //  - //ro1 and //ft1 are specified before //ro2 so never run
+  //  - //fb is specified after, but it's set to fallback and hence //ro2
+  //    should run first (and not continue)
+
+  EXPECT_TRUE(FS->status("/ro1/f").getError());
+  EXPECT_TRUE(FS->status("/ft1/f").getError());
+  EXPECT_TRUE(FS->status("/fb/f").getError());
+
+  EXPECT_PATHS(*FS, "/ro2/f", "/real/f", "/real/f");
+  EXPECT_PATHS(*FS, "/ft2/f", "/real/f", "/real/f");
+}
+
+// Ensure overlays are read from the OverlayFS built so far
+TEST(VFSFromYAMLsTest, OverlayFromVFS) {
+  std::string FT1 = createSimpleOverlay("fallthrough", "/vfs1", "/a");
+  std::string FT2 = createSimpleOverlay("fallthrough", "/vfs2", "/b");
+  std::string FT3 = createSimpleOverlay("fallthrough", "/vfs3", "/c");
+  std::string RO = createSimpleOverlay("redirect-only", "/vfs", "/a");
+
+  auto Real = makeIntrusiveRefCnt<vfs::InMemoryFileSystem>();
+  Real->addFile("/ft1.yaml", 0, MemoryBuffer::getMemBuffer(FT1));
+  Real->addFile("/ft2.yaml", 0, MemoryBuffer::getMemBuffer(FT2));
+  Real->addFile("/a/ft3.yaml", 0, MemoryBuffer::getMemBuffer(FT3));
+  Real->addFile("/ro.yaml", 0, MemoryBuffer::getMemBuffer(RO));
+  Real->addFile("/a/f", 0, MemoryBuffer::getMemBuffer("a"));
+  Real->addFile("/b/f", 0, MemoryBuffer::getMemBuffer("b"));
+  Real->addFile("/c/f", 0, MemoryBuffer::getMemBuffer("c"));
+  Real->setCurrentWorkingDirectory("/");
+
+  // 3 to check we're not just using the last overlay
+  auto ExpectedFS =
+      vfs::getVFSFromYAMLs({"/ft1.yaml", "/ft2.yaml", "/vfs1/ft3.yaml"}, Real);
+  ASSERT_THAT_EXPECTED(ExpectedFS, Succeeded());
+  auto FS = std::move(*ExpectedFS);
+  FS->print(llvm::errs(), vfs::FileSystem::PrintType::RecursiveContents);
+  ASSERT_TRUE(FS);
+  EXPECT_PATHS(*FS, "/vfs1/f", "/a/f", "/a/f");
+  EXPECT_PATHS(*FS, "/vfs2/f", "/b/f", "/b/f");
+  EXPECT_PATHS(*FS, "/vfs3/f", "/c/f", "/c/f");
+
+  // If redirect-only is given, any further overlays *must* be specified by it
+  ExpectedFS = vfs::getVFSFromYAMLs({"/ro.yaml", "/a/ft3.yaml"}, Real);
+  EXPECT_THAT_EXPECTED(ExpectedFS, Failed());
+
+  ExpectedFS = vfs::getVFSFromYAMLs({"/ro.yaml", "/vfs/ft3.yaml"}, Real);
+  ASSERT_THAT_EXPECTED(ExpectedFS, Succeeded());
+  FS = std::move(*ExpectedFS);
+  ASSERT_TRUE(FS);
+  EXPECT_PATHS(*FS, "/vfs/f", "/a/f", "/a/f");
 }

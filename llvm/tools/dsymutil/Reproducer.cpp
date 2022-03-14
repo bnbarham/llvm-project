@@ -48,15 +48,15 @@ ReproducerUse::~ReproducerUse() = default;
 ReproducerUse::ReproducerUse(StringRef Root, std::error_code &EC) {
   SmallString<128> Mapping(Root);
   sys::path::append(Mapping, "mapping.yaml");
-  ErrorOr<std::unique_ptr<MemoryBuffer>> Buffer =
-      vfs::getRealFileSystem()->getBufferForFile(Mapping.str());
 
-  if (!Buffer) {
-    EC = Buffer.getError();
+  auto OverlayFS = llvm::vfs::getVFSFromYAMLs(Mapping.str());
+  if (auto Err = OverlayFS.takeError()) {
+    llvm::handleAllErrors(std::move(Err), [&](const llvm::ErrorInfoBase &E) {
+      EC = E.convertToErrorCode();
+    });
     return;
   }
-
-  VFS = llvm::vfs::getVFSFromYAML(std::move(Buffer.get()), nullptr, Mapping);
+  VFS = std::move(*OverlayFS);
 }
 
 llvm::Expected<std::unique_ptr<Reproducer>>
