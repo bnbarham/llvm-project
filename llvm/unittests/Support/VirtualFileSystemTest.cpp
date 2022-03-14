@@ -1833,30 +1833,21 @@ TEST_F(VFSFromYAMLTest, RemappedDirectoryOverlayNoFallthrough) {
   EXPECT_EQ(0, NumDiagnostics);
 }
 
-TEST_F(VFSFromYAMLTest, ReturnsRequestedPathVFSMiss) {
+TEST_F(VFSFromYAMLTest, RelativeVFSPathMiss) {
   IntrusiveRefCntPtr<vfs::InMemoryFileSystem> BaseFS(
       new vfs::InMemoryFileSystem);
   BaseFS->addFile("//root/foo/a", 0,
                   MemoryBuffer::getMemBuffer("contents of a"));
   ASSERT_FALSE(BaseFS->setCurrentWorkingDirectory("//root/foo"));
+
   auto RemappedFS = vfs::RedirectingFileSystem::create(
       {}, /*UseExternalNames=*/false, *BaseFS);
 
-  auto OpenedF = RemappedFS->openFileForRead("a");
+  auto OpenedF = BaseFS->openFileForRead("a");
   ASSERT_FALSE(OpenedF.getError());
-  llvm::ErrorOr<std::string> Name = (*OpenedF)->getName();
-  ASSERT_FALSE(Name.getError());
-  EXPECT_EQ("a", Name.get());
 
-  auto OpenedS = (*OpenedF)->status();
-  ASSERT_FALSE(OpenedS.getError());
-  EXPECT_EQ("a", OpenedS->getName());
-  EXPECT_FALSE(OpenedS->ExposesExternalVFSPath);
-
-  auto DirectS = RemappedFS->status("a");
-  ASSERT_FALSE(DirectS.getError());
-  EXPECT_EQ("a", DirectS->getName());
-  EXPECT_FALSE(DirectS->ExposesExternalVFSPath);
+  OpenedF = RemappedFS->openFileForRead("a");
+  ASSERT_TRUE(OpenedF.getError());
 
   EXPECT_EQ(0, NumDiagnostics);
 }
@@ -3249,6 +3240,77 @@ TEST(RedirectingFileSystemTest, IsRelativeIgnoresCWD) {
   EXPECT_PATHS(*FS, "/a/b", "/real/f", "/real/f");
   FS->setCurrentWorkingDirectory("/other2");
   EXPECT_PATHS(*FS, "/a/b", "/real/f", "/real/f");
+}
+
+TEST(RedirectingFileSystemTest, Basic) {
+  auto Real = makeIntrusiveRefCnt<DummyFileSystem>();
+  Real->addRegularFile("/real/f");
+
+  SmallVector<std::pair<std::string, std::string>> Mappings = {
+      {"/vfs/a", "/real/f"}};
+  auto FS = vfs::RedirectingFileSystem::create(Mappings, true, *Real);
+  ASSERT_TRUE(FS);
+
+  EXPECT_PATHS(*FS, "/vfs/a", "/real/f", "/real/f");
+
+  // Should not check ExternalFS
+  auto S = FS->status("/real/f");
+  ASSERT_TRUE(S.getError());
+
+  FS = vfs::RedirectingFileSystem::create(Mappings, false, *Real);
+  ASSERT_TRUE(FS);
+
+  // Returning the original path for realpath doesn't make sense, so expect the
+  // external here
+  EXPECT_PATHS(*FS, "/vfs/a", "/vfs/a", "/real/f");
+}
+
+// Check that a mapped directory and its parents all return a status with the
+// correct path
+TEST(RedirectingFileSystemTest, DirectoryStatus) {
+  auto Real = makeIntrusiveRefCnt<DummyFileSystem>();
+  Real->addDirectory("/real");
+
+  SmallVector<std::pair<std::string, std::string>> Mappings = {
+      {"/a/b/c", "/real"}};
+  auto FS = vfs::RedirectingFileSystem::create(Mappings, true, *Real);
+  ASSERT_TRUE(FS);
+
+  auto S = FS->status("/a");
+  ASSERT_FALSE(S.getError());
+  EXPECT_EQ("/a", S->getName());
+
+  S = FS->status("/a/b");
+  ASSERT_FALSE(S.getError());
+  EXPECT_EQ("/a/b", S->getName());
+
+  S = FS->status("/a/b/c");
+  ASSERT_FALSE(S.getError());
+  EXPECT_EQ("/real", S->getName());
+
+  FS->setCurrentWorkingDirectory("/a");
+
+  S = FS->status("b");
+  ASSERT_FALSE(S.getError());
+  EXPECT_EQ("/a/b", S->getName());
+
+  S = FS->status("b/c");
+  ASSERT_FALSE(S.getError());
+  EXPECT_EQ("/real", S->getName());
+
+  FS = vfs::RedirectingFileSystem::create(Mappings, false, *Real);
+  ASSERT_TRUE(FS);
+
+  // External names is false, use the passed in path instead
+  FS->setCurrentWorkingDirectory("/a");
+
+  S = FS->status("b");
+  ASSERT_FALSE(S.getError());
+  EXPECT_EQ("b", S->getName());
+
+  S = FS->status("b/c");
+  ASSERT_FALSE(S.getError());
+  EXPECT_EQ("b/c", S->getName());
 }
 
 static std::unique_ptr<vfs::OverlayFileSystem>

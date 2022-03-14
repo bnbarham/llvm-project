@@ -745,25 +745,6 @@ public:
   enum EntryKind { EK_Directory, EK_DirectoryRemap, EK_File };
   enum NameKind { NK_NotSet, NK_External, NK_Virtual };
 
-  // TODO: Simplify RedirectingFileSystem to remove redirection completely.
-  // Remove RedirectKind, Redirection, and all non-redirect-only paths. Require
-  // any old uses to move to using OverlayFileSystem instead (see the new
-  // getVFSFromYAMLs API).
-
-  /// The type of redirection to perform.
-  enum class RedirectKind {
-    /// Lookup the redirected path first (ie. the one specified in
-    /// 'external-contents') and if that fails "fallthrough" to a lookup of the
-    /// originally provided path.
-    Fallthrough,
-    /// Lookup the provided path first and if that fails, "fallback" to a
-    /// lookup of the redirected path.
-    Fallback,
-    /// Only lookup the redirected path, do not lookup the originally provided
-    /// path.
-    RedirectOnly
-  };
-
   /// A single file or directory in the VFS.
   class Entry {
     EntryKind Kind;
@@ -941,9 +922,6 @@ private:
   /// names of files.  This global value is overridable on a per-file basis.
   bool UseExternalNames = true;
 
-  /// Determines the lookups to perform, as well as their order. See
-  /// \c RedirectKind for details.
-  RedirectKind Redirection = RedirectKind::Fallthrough;
   /// @}
 
   RedirectingFileSystem(IntrusiveRefCntPtr<FileSystem> ExternalFS);
@@ -956,18 +934,17 @@ private:
                                        llvm::sys::path::const_iterator End,
                                        Entry *From) const;
 
-  /// Get the status for a path with the provided \c LookupResult.
-  ErrorOr<Status> status(const Twine &CanonicalPath, const Twine &OriginalPath,
-                         const LookupResult &Result);
-
 public:
   /// Looks up \p Path in \c Roots and returns a LookupResult giving the
   /// matched entry and, if the entry was a FileEntry or DirectoryRemapEntry,
   /// the path it redirects to in the external file system.
-  ErrorOr<LookupResult> lookupPath(StringRef Path) const;
+  ErrorOr<LookupResult> lookupPath(StringRef CanonicalPath) const;
 
-  /// Parses \p Buffer, which is expected to be in YAML format and
-  /// returns a virtual file system representing its contents.
+  /// Parses \p Buffer, which is expected to be in the YAML format described
+  /// in \c RedirectingFileSystem and returns a virtual file system
+  /// representing its contents.
+  ///
+  /// \see getVFSFromYAMLs
   static std::unique_ptr<RedirectingFileSystem>
   create(std::unique_ptr<MemoryBuffer> Buffer,
          SourceMgr::DiagHandlerTy DiagHandler, StringRef YAMLFilePath,
@@ -994,12 +971,6 @@ public:
   std::error_code makeAbsolute(SmallVectorImpl<char> &Path) const override;
 
   directory_iterator dir_begin(const Twine &Dir, std::error_code &EC) override;
-
-  /// Sets the redirection kind to \c Fallthrough if true or \c RedirectOnly
-  /// otherwise. Will removed in the future, use \c setRedirection instead.
-  void setFallthrough(bool Fallthrough);
-
-  void setRedirection(RedirectingFileSystem::RedirectKind Kind);
 
   std::vector<llvm::StringRef> getRoots() const;
 
